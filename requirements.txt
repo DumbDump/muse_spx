@@ -1,0 +1,2 @@
+# Standard library only: paper_trader.py uses no third-party packages.
+# This file exists so Railway's builder detects this as a Python app.
