@@ -13,7 +13,7 @@ reach a live account.
   5-point strike.
 - Short leg 3-5 DTE at entry, long leg the next expiry after it. Any
   weekday pair qualifies.
-- Entry window 10:30-11:30 a.m. America/Los_Angeles, weekdays only, one
+- Entry window 7:00-11:30 a.m. America/Los_Angeles, weekdays only, one
   entry per day, only when flat.
 - Max debit $10.00 per share. If no qualifying pair is at or under $10,
   the day is skipped.

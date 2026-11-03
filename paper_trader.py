@@ -12,7 +12,7 @@ Implements one fixed rule set, nothing else:
   5-point strike.
 - Short leg 3-5 DTE at entry, long leg the next expiry after the short leg.
   Any weekday pair qualifies.
-- Entry window 10:30-11:30 a.m. America/Los_Angeles, weekdays only.
+- Entry window 7:00-11:30 a.m. America/Los_Angeles, weekdays only.
 - Max debit $10.00 per share, as low as possible. If no qualifying pair
   previews at or under $10, the day is skipped.
 - Max 5 contracts per trade, one position at a time.
@@ -76,7 +76,7 @@ API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(5, int(os.environ.get("CONTRACTS", "5"))))
 MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "10.00"))
-ENTRY_START = dtime(10, 30)
+ENTRY_START = dtime(7, 0)
 ENTRY_END = dtime(11, 30)
 CLOSE_START = dtime(12, 30)
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
