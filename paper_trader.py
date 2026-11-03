@@ -121,7 +121,14 @@ def get_balances(account):
 
 def get_positions(account):
     data = api_get("/v1/accounts/%s/positions" % account)
-    pos = data.get("positions", {}).get("position")
+    positions = data.get("positions")
+    # Tradier returns the string "null" (not an object) when the account
+    # is flat; treat any non-dict value as "no positions" instead of
+    # crashing on .get(). This bit us on 2026-11-03: every poll errored
+    # from the moment the account went flat until this guard was added.
+    if not isinstance(positions, dict):
+        return []
+    pos = positions.get("position")
     if pos is None:
         return []
     if isinstance(pos, dict):
@@ -219,7 +226,12 @@ def find_best_pair(spx_price, expirations):
 def get_pending_orders(account):
     """Return working orders (status pending/open) with leg symbols and tag."""
     data = api_get("/v1/accounts/%s/orders" % account)
-    orders = data.get("orders", {}).get("order")
+    orders_obj = data.get("orders")
+    # Same empty-response quirk as positions: a non-dict value means no
+    # orders, not a crash.
+    if not isinstance(orders_obj, dict):
+        return []
+    orders = orders_obj.get("order")
     if orders is None:
         return []
     if isinstance(orders, dict):
