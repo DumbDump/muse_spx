@@ -20,6 +20,11 @@ Implements one fixed rule set, nothing else:
   1:00 p.m. PT the same day (the program starts closing at 12:30 p.m. PT).
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement and fill is logged immediately.
+- Every order carries a tag ("muse-spx" by default, overridable with
+  ORDER_TAG) so the worker's own orders are identifiable.
+- At most one pending order at a time: before placing, the worker checks
+  open orders and skips if an order with its tag, or with the same leg
+  symbols, is already pending. It never cancels anything on its own.
 
 Safety:
 
@@ -75,6 +80,7 @@ ENTRY_START = dtime(10, 30)
 ENTRY_END = dtime(11, 30)
 CLOSE_START = dtime(12, 30)
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx")
 
 
 def log(msg):
@@ -210,14 +216,59 @@ def find_best_pair(spx_price, expirations):
     return best
 
 
+def get_pending_orders(account):
+    """Return working orders (status pending/open) with leg symbols and tag."""
+    data = api_get("/v1/accounts/%s/orders" % account)
+    orders = data.get("orders", {}).get("order")
+    if orders is None:
+        return []
+    if isinstance(orders, dict):
+        orders = [orders]
+    pending = []
+    for order in orders:
+        if order.get("status") not in ("pending", "open"):
+            continue
+        legs = order.get("leg")
+        if isinstance(legs, dict):
+            legs = [legs]
+        symbols = {leg.get("option_symbol") for leg in (legs or [])}
+        symbols.discard(None)
+        pending.append({
+            "id": order.get("id"),
+            "tag": order.get("tag"),
+            "symbols": symbols,
+        })
+    return pending
+
+
+def has_blocking_pending_order(account, legs):
+    """True when the worker already has a pending order that would collide
+    with the given legs: same tag, or the same leg symbols. Matching on leg
+    symbols means the check works even for orders placed before tagging, and
+    even if the provider does not echo the tag back."""
+    new_symbols = {symbol for _, symbol, _ in legs}
+    for order in get_pending_orders(account):
+        if order["tag"] == ORDER_TAG or order["symbols"] == new_symbols:
+            return True, order["id"]
+    return False, None
+
+
 def place_order(account, order_type, price, legs):
-    """legs: list of (side, symbol, qty). Returns the API response dict."""
+    """legs: list of (side, symbol, qty). Returns the API response dict.
+    Never creates a second pending order: if a colliding order is already
+    pending, the placement is skipped and logged."""
+    blocked, blocking_id = has_blocking_pending_order(account, legs)
+    if blocked:
+        log("SKIPPED %s order at %.2f: pending order %s already exists"
+            % (order_type, price, blocking_id))
+        return {"blocked": True, "blocking_order_id": blocking_id}
     fields = {
         "class": "multileg",
         "symbol": "SPX",
         "type": order_type,
         "duration": "day",
         "price": "%.2f" % price,
+        "tag": ORDER_TAG,
     }
     for i, (side, symbol, qty) in enumerate(legs):
         fields["option_symbol[%d]" % i] = symbol
