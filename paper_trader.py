@@ -138,9 +138,16 @@ def get_positions(account):
 
 def get_spx_price():
     data = api_get("/v1/markets/quotes?symbols=SPX&greeks=false")
-    quote = data["quotes"]["quote"]
+    quotes_obj = data.get("quotes")
+    # Sandbox sometimes returns JSON null here; raise a clean error so the
+    # poll retries instead of dying on a NoneType subscript.
+    if not isinstance(quotes_obj, dict):
+        raise ValueError("SPX quote unavailable (null quotes)")
+    quote = quotes_obj.get("quote")
     if isinstance(quote, list):
-        quote = quote[0]
+        quote = quote[0] if quote else None
+    if not isinstance(quote, dict) or quote.get("last") is None:
+        raise ValueError("SPX quote unavailable (null quote)")
     return float(quote["last"])
 
 
@@ -174,12 +181,19 @@ def get_expirations():
 
 
 def get_chain_mids(expiry):
-    """Return {(strike, kind): mid} for one expiry."""
+    """Return {(strike, kind): mid} for one expiry, or {} when the endpoint
+    returns no usable chain data (JSON null). Callers treat {} as 'this
+    expiry skipped', never as a crash."""
     data = api_get(
         "/v1/markets/options/chains?symbol=SPXW&expiration=%s&greeks=false"
         % expiry.isoformat()
     )
-    options = data["options"]["option"]
+    options_obj = data.get("options")
+    if not isinstance(options_obj, dict):
+        return {}
+    options = options_obj.get("option")
+    if options is None:
+        return {}
     if isinstance(options, dict):
         options = [options]
     mids = {}
@@ -200,6 +214,7 @@ def find_best_pair(spx_price, expirations):
     call_strike = round_strike(spx_price + 50)
     today = datetime.now(TZ).date()
     best = None
+    saw_chains = False
     for i, short_exp in enumerate(expirations):
         dte = (short_exp - today).days
         if dte < 3 or dte > 5:
@@ -209,6 +224,8 @@ def find_best_pair(spx_price, expirations):
         long_exp = expirations[i + 1]
         short_mids = get_chain_mids(short_exp)
         long_mids = get_chain_mids(long_exp)
+        if short_mids or long_mids:
+            saw_chains = True
         try:
             debit = (
                 long_mids[(put_strike, "put")]
@@ -220,6 +237,11 @@ def find_best_pair(spx_price, expirations):
             continue
         if debit <= MAX_DEBIT and (best is None or debit < best[4]):
             best = (short_exp, long_exp, put_strike, call_strike, round(debit, 2))
+    if not saw_chains:
+        # No chain data at all: a transient endpoint outage, not a "no
+        # qualifying pair" day. Raise so the poll retries instead of
+        # marking today skipped.
+        raise ValueError("no option chains data from Tradier")
     return best
 
 
