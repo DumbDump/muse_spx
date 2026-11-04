@@ -216,12 +216,16 @@ def get_chain_mids(expiry):
 
 
 def find_best_pair(spx_price, expirations):
-    """Return (short_exp, long_exp, put, call, debit) for the cheapest pair
-    at or under MAX_DEBIT, or None when no pair qualifies."""
+    """Return (qualifying, cheapest): the cheapest pair at or under
+    MAX_DEBIT (or None), plus the cheapest pair at any debit (or None
+    when no candidate had full chain data). The cheapest pair is what
+    the skip line prints, so the log shows the actual price even on a
+    skipped day."""
     put_strike = round_strike(spx_price - 50)
     call_strike = round_strike(spx_price + 50)
     today = datetime.now(TZ).date()
     best = None
+    cheapest = None
     saw_chains = False
     for i, short_exp in enumerate(expirations):
         dte = (short_exp - today).days
@@ -243,14 +247,17 @@ def find_best_pair(spx_price, expirations):
             )
         except KeyError:
             continue
+        candidate = (short_exp, long_exp, put_strike, call_strike, round(debit, 2))
+        if cheapest is None or candidate[4] < cheapest[4]:
+            cheapest = candidate
         if debit <= MAX_DEBIT and (best is None or debit < best[4]):
-            best = (short_exp, long_exp, put_strike, call_strike, round(debit, 2))
+            best = candidate
     if not saw_chains:
         # No chain data at all: a transient endpoint outage, not a "no
         # qualifying pair" day. Raise so the poll retries instead of
         # marking today skipped.
         raise ValueError("no option chains data from Tradier")
-    return best
+    return best, cheapest
 
 
 def get_pending_orders(account):
@@ -434,10 +441,18 @@ def run_once():
                 if (ENTRY_START <= now.time() < ENTRY_END
                         and last_entry_day != today):
                     spx = get_spx_price()
-                    pair = find_best_pair(spx, get_expirations())
+                    pair, cheapest = find_best_pair(spx, get_expirations())
                     if pair is None:
-                        log("no pair at or under %.2f, skipping today (SPX %.2f)"
-                            % (MAX_DEBIT, spx))
+                        if cheapest is not None:
+                            log("no pair at or under %.2f, skipping today "
+                                "(SPX %.2f, best pair %.2f short %s / long %s "
+                                "%dP/%dC)"
+                                % (MAX_DEBIT, spx, cheapest[4], cheapest[0],
+                                   cheapest[1], cheapest[2], cheapest[3]))
+                        else:
+                            log("no pair at or under %.2f, skipping today "
+                                "(SPX %.2f, no candidate pair had full chain data)"
+                                % (MAX_DEBIT, spx))
                         last_entry_day = today
                     else:
                         short_exp, long_exp, put, call, debit = pair
