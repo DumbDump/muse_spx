@@ -12,19 +12,26 @@ Implements one fixed rule set, nothing else:
   5-point strike.
 - Short leg 3-5 DTE at entry, long leg the next expiry after the short leg.
   Any weekday pair qualifies.
-- Entry window 7:00-11:30 a.m. America/Los_Angeles, weekdays only.
-- Max debit $10.00 per share, as low as possible. If no qualifying pair
-  previews at or under $10, the day is skipped.
+- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
+- Walk-up entry, no day skip: while flat and in the window, the worker
+  evaluates every poll (3 minutes). When the cheapest pair previews at
+  or under $11.00, it bids $9.00 and walks up $0.10 every 30 seconds to
+  $11.00, cancelling and replacing at each step; a fill at any step
+  opens the position. An unfilled cycle cancels and waits 5 minutes
+  before the next cycle. Pairs over $11.00 are logged with their actual
+  price and retried next poll.
 - Max 5 contracts per trade, one position at a time.
-- Exit at a 10% gain on the debit basis, and in all cases close before
-  1:00 p.m. PT the same day (the program starts closing at 12:30 p.m. PT).
+- Exit at a 10% gain on the debit basis. There is no end-of-day forced
+  close: a position that never reaches 10% stays open (and blocks new
+  entries) until it does.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement and fill is logged immediately.
 - Every order carries a tag ("muse-spx" by default, overridable with
   ORDER_TAG) so the worker's own orders are identifiable.
 - At most one pending order at a time: before placing, the worker checks
   open orders and skips if an order with its tag, or with the same leg
-  symbols, is already pending. It never cancels anything on its own.
+  symbols, is already pending. Walk-up steps cancel the worker's own
+  working order before replacing it; it never cancels anyone else's order.
 
 Safety:
 
@@ -52,8 +59,8 @@ Notes:
 - Tradier sandbox quotes are delayed about 15 minutes. Mids computed here
   are estimates, not live brokerage marks.
 - This program places day orders. An order left unfilled at the close
-  expires with the session, and any position still open is carried
-  overnight (a rule miss the logs will show plainly).
+  expires with the session. Positions are closed only on the 10% gain
+  exit, so a position may be carried overnight by design.
 
 Usage:
 
@@ -77,11 +84,13 @@ BASE = "https://%s" % HOST
 API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(5, int(os.environ.get("CONTRACTS", "5"))))
-MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "10.00"))
-ENTRY_START = dtime(7, 0)
-ENTRY_END = dtime(11, 30)
-CLOSE_START = dtime(12, 30)
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "11.00"))
+WALK_START = float(os.environ.get("WALK_START", "9.00"))
+WALK_STEP = float(os.environ.get("WALK_STEP", "0.10"))
+ENTRY_START = dtime(6, 45)
+ENTRY_END = dtime(12, 30)
+COOLDOWN_SECONDS = 300
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "180"))
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx")
 
 
@@ -366,6 +375,93 @@ def close_position(account, legs):
     return place_order(account, "credit", credit, close_legs)
 
 
+def get_order_status(account, order_id):
+    """Return the status string of one order ('filled', 'open', ...)."""
+    data = api_get("/v1/accounts/%s/orders/%s" % (account, order_id))
+    order = data.get("order", data)
+    if isinstance(order, list):
+        order = order[0] if order else {}
+    return order.get("status")
+
+
+def cancel_order(account, order_id):
+    """Cancel one working order. Tradier cancels via DELETE on the order."""
+    req = urllib.request.Request(
+        BASE + "/v1/accounts/%s/orders/%s" % (account, order_id), method="DELETE"
+    )
+    req.add_header("Accept", "application/json")
+    req.add_header("Authorization", "Bearer %s" % API_KEY)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def run_walkup_cycle(account, short_exp, long_exp, put, call):
+    """Bid a pair from WALK_START up to MAX_DEBIT in WALK_STEP steps.
+
+    Places a debit limit order, waits 30 seconds, and if it is still
+    working, cancels it and re-places one step higher. Returns True when
+    the order filled (or partially filled, leaving a position), False
+    when the walk reached the ceiling unfilled or was blocked. A cycle
+    started inside the entry window is allowed to finish even if the
+    window ends mid-cycle. Only the worker's own tagged order is ever
+    cancelled, and only after the one-pending check passes."""
+    legs = [
+        ("sell_to_open", option_symbol(short_exp, put, "P"), CONTRACTS),
+        ("sell_to_open", option_symbol(short_exp, call, "C"), CONTRACTS),
+        ("buy_to_open", option_symbol(long_exp, put, "P"), CONTRACTS),
+        ("buy_to_open", option_symbol(long_exp, call, "C"), CONTRACTS),
+    ]
+    log("walk-up: cycle starting short %s / long %s %dP/%dC"
+        % (short_exp, long_exp, put, call))
+    price = WALK_START
+    while price <= MAX_DEBIT + 1e-9:
+        price = round(price, 2)
+        resp = place_order(account, "debit", price, legs)
+        if resp.get("blocked"):
+            log("walk-up: blocked by an existing pending order, cycle aborted")
+            return False
+        if resp.get("dry_run"):
+            return False
+        order = resp.get("order", resp)
+        order_id = order.get("id")
+        if not order_id:
+            log("walk-up: order response without id, cycle aborted: %s" % resp)
+            return False
+        time.sleep(30)
+        try:
+            status = get_order_status(account, order_id)
+        except Exception as exc:  # noqa: BLE001 - cancel anyway below
+            log("walk-up: status check failed (%s), cancelling order %s"
+                % (exc, order_id))
+            status = None
+        if status == "filled":
+            log("walk-up: filled at %.2f (order %s)" % (price, order_id))
+            return True
+        if status in ("open", "pending", "partially_filled", None):
+            try:
+                cancel_order(account, order_id)
+            except Exception as exc:  # noqa: BLE001 - re-check below
+                log("walk-up: cancel of order %s failed (%s)" % (order_id, exc))
+            if status == "partially_filled":
+                log("walk-up: partially filled at %.2f (order %s), stopping cycle"
+                    % (price, order_id))
+                return True
+            # Re-check: it may have filled while the cancel was in flight.
+            try:
+                if get_order_status(account, order_id) == "filled":
+                    log("walk-up: filled at %.2f (order %s)" % (price, order_id))
+                    return True
+            except Exception:
+                pass
+            log("walk-up: %.2f unfilled, cancelled, walking up" % price)
+        else:
+            log("walk-up: order %s ended as %s at %.2f"
+                % (order_id, status, price))
+        price = round(price + WALK_STEP, 2)
+    log("walk-up: reached %.2f unfilled, cycle done" % MAX_DEBIT)
+    return False
+
+
 def pnl_snapshot(account):
     bal = get_balances(account)
     value, basis, legs = position_value_and_basis(account)
@@ -374,19 +470,13 @@ def pnl_snapshot(account):
            len(legs)))
 
 
-def heartbeat_line(now, legs, value, basis, last_entry_day, spx_txt):
+def heartbeat_line(now, legs, value, basis, spx_txt, flat_state):
     """One short status line per poll: flat/open, SPX, and state."""
     if legs:
         unrealized = value - basis
         return ("heartbeat: open %d legs unrealized %.2f on basis %.2f SPX %s"
                 % (len(legs), unrealized, basis, spx_txt))
-    if ENTRY_START <= now.time() < ENTRY_END and last_entry_day != now.date():
-        state = "in window, will evaluate"
-    elif last_entry_day == now.date():
-        state = "day skipped"
-    else:
-        state = "waiting for window"
-    return "heartbeat: flat SPX %s %s" % (spx_txt, state)
+    return "heartbeat: flat SPX %s %s" % (spx_txt, flat_state)
 
 
 def run_once():
@@ -396,8 +486,8 @@ def run_once():
     account = resolve_account()
     log("account %s connected (paper host %s, trading %s, contracts %d)"
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run", CONTRACTS))
-    last_entry_day = None
     last_pnl_day = {}
+    next_cycle_time = None
     while True:
         try:
             now = datetime.now(TZ)
@@ -421,51 +511,54 @@ def run_once():
                 spx_txt = "%.2f" % get_spx_price()
             except Exception:
                 spx_txt = "?"
-            log(heartbeat_line(now, legs, value, basis, last_entry_day, spx_txt))
+            if legs:
+                flat_state = ""
+            elif ENTRY_START <= now.time() < ENTRY_END:
+                if next_cycle_time is not None and now < next_cycle_time:
+                    flat_state = ("cooling down until %s"
+                                  % next_cycle_time.strftime("%H:%M"))
+                else:
+                    flat_state = "in window, will evaluate"
+            else:
+                flat_state = "waiting for window"
+            log(heartbeat_line(now, legs, value, basis, spx_txt, flat_state))
             if legs:
                 unrealized = value - basis
-                # 10% gain exit, any time of day.
+                # 10% gain exit, any time of day. This is the only exit:
+                # there is no end-of-day forced close, so a position that
+                # never reaches 10% stays open (and blocks new entries).
                 if basis > 0 and unrealized >= 0.10 * basis:
                     log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, basis))
                     close_position(account, legs)
                     time.sleep(POLL_SECONDS)
                     continue
-                # Same-day close: start closing at 12:30 p.m. PT.
-                if now.time() >= CLOSE_START:
-                    log("close window: closing open position before 1:00 p.m. PT")
-                    close_position(account, legs)
-                    time.sleep(POLL_SECONDS)
-                    continue
             else:
-                # Entry window, one entry per day, only when flat.
+                # Walk-up entry, no day skip: while flat and in the
+                # window, evaluate every poll; an unfilled cycle cools
+                # down for 5 minutes before the next one.
                 if (ENTRY_START <= now.time() < ENTRY_END
-                        and last_entry_day != today):
+                        and (next_cycle_time is None or now >= next_cycle_time)):
                     spx = get_spx_price()
                     pair, cheapest = find_best_pair(spx, get_expirations())
                     if pair is None:
                         if cheapest is not None:
-                            log("no pair at or under %.2f, skipping today "
+                            log("no pair at or under %.2f "
                                 "(SPX %.2f, best pair %.2f short %s / long %s "
-                                "%dP/%dC)"
+                                "%dP/%dC), will retry next poll"
                                 % (MAX_DEBIT, spx, cheapest[4], cheapest[0],
                                    cheapest[1], cheapest[2], cheapest[3]))
                         else:
-                            log("no pair at or under %.2f, skipping today "
-                                "(SPX %.2f, no candidate pair had full chain data)"
+                            log("no pair at or under %.2f "
+                                "(SPX %.2f, no candidate pair had full chain data), "
+                                "will retry next poll"
                                 % (MAX_DEBIT, spx))
-                        last_entry_day = today
                     else:
                         short_exp, long_exp, put, call, debit = pair
-                        legs = [
-                            ("sell_to_open", option_symbol(short_exp, put, "P"), CONTRACTS),
-                            ("sell_to_open", option_symbol(short_exp, call, "C"), CONTRACTS),
-                            ("buy_to_open", option_symbol(long_exp, put, "P"), CONTRACTS),
-                            ("buy_to_open", option_symbol(long_exp, call, "C"), CONTRACTS),
-                        ]
-                        log("entry: SPX %.2f short %s / long %s %dP/%dC debit %.2f x %d"
+                        log("entry: SPX %.2f short %s / long %s %dP/%dC modeled debit %.2f x %d"
                             % (spx, short_exp, long_exp, put, call, debit, CONTRACTS))
-                        place_order(account, "debit", min(debit, MAX_DEBIT), legs)
-                        last_entry_day = today
+                        filled = run_walkup_cycle(account, short_exp, long_exp, put, call)
+                        if not filled:
+                            next_cycle_time = datetime.now(TZ) + timedelta(minutes=5)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)
         time.sleep(POLL_SECONDS)
