@@ -160,9 +160,13 @@ def option_symbol(expiry, strike, kind):
 
 
 def get_expirations():
-    """Return sorted expiry dates. Falls back to weekday-derived dates."""
+    """Return sorted expiry dates. Falls back to weekday-derived dates.
+    NOTE: Tradier's expirations endpoint takes the underlying SPX, not the
+    weekly root SPXW — SPXW returns HTTP 200 with JSON null. And
+    includeAllRoots=true is required, otherwise only monthly expiries come
+    back and the 3-5 DTE rule can never match."""
     try:
-        data = api_get("/v1/markets/options/expirations?symbol=SPXW&includeAllRoots=false")
+        data = api_get("/v1/markets/options/expirations?symbol=SPX&includeAllRoots=true")
         dates = data["expirations"]["date"]
         if isinstance(dates, str):
             dates = [dates]
@@ -183,9 +187,11 @@ def get_expirations():
 def get_chain_mids(expiry):
     """Return {(strike, kind): mid} for one expiry, or {} when the endpoint
     returns no usable chain data (JSON null). Callers treat {} as 'this
-    expiry skipped', never as a crash."""
+    expiry skipped', never as a crash.
+    NOTE: chains take the underlying SPX; SPXW returns JSON null. The
+    returned option symbols are still SPXW, which is what legs use."""
     data = api_get(
-        "/v1/markets/options/chains?symbol=SPXW&expiration=%s&greeks=false"
+        "/v1/markets/options/chains?symbol=SPX&expiration=%s&greeks=false"
         % expiry.isoformat()
     )
     options_obj = data.get("options")
