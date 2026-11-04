@@ -42,8 +42,10 @@ Railway setup:
   and set TRADIER_API_KEY to a Tradier SANDBOX (paper) key.
 - Procfile runs: worker: python paper_trader.py
 - The worker loops forever, so Railway keeps it running. Logs are the
-  P&L record: the program prints a P&L line at 6:00 a.m. and 8:00 a.m. PT
-  on weekdays, plus a line for every entry, exit, skip, and error.
+  P&L record: the program prints a heartbeat line every poll (so silence
+  never means "is it running?"), a P&L line on the first poll of the
+  6:00 a.m. and 8:00 a.m. PT hours on weekdays, plus a line for every
+  entry, exit, skip, and error.
 
 Notes:
 
@@ -365,6 +367,21 @@ def pnl_snapshot(account):
            len(legs)))
 
 
+def heartbeat_line(now, legs, value, basis, last_entry_day, spx_txt):
+    """One short status line per poll: flat/open, SPX, and state."""
+    if legs:
+        unrealized = value - basis
+        return ("heartbeat: open %d legs unrealized %.2f on basis %.2f SPX %s"
+                % (len(legs), unrealized, basis, spx_txt))
+    if ENTRY_START <= now.time() < ENTRY_END and last_entry_day != now.date():
+        state = "in window, will evaluate"
+    elif last_entry_day == now.date():
+        state = "day skipped"
+    else:
+        state = "waiting for window"
+    return "heartbeat: flat SPX %s %s" % (spx_txt, state)
+
+
 def run_once():
     if not API_KEY:
         log("TRADIER_API_KEY is not set, exiting")
@@ -384,10 +401,20 @@ def run_once():
             # Daily P&L lines at 6:00 and 8:00 a.m. PT.
             for hour in (6, 8):
                 key = (today, hour)
-                if now.hour == hour and now.minute < 2 and last_pnl_day.get(hour) != today:
+                # First poll of the hour, not minute < 2: with 5-minute
+                # polling the 2-minute window was usually missed (Nov 4
+                # printed neither P&L line).
+                if now.hour == hour and last_pnl_day.get(hour) != today:
                     pnl_snapshot(account)
                     last_pnl_day[hour] = today
             value, basis, legs = position_value_and_basis(account)
+            # Heartbeat every poll: one short line so the log always shows
+            # the worker is alive and what it is doing.
+            try:
+                spx_txt = "%.2f" % get_spx_price()
+            except Exception:
+                spx_txt = "?"
+            log(heartbeat_line(now, legs, value, basis, last_entry_day, spx_txt))
             if legs:
                 unrealized = value - basis
                 # 10% gain exit, any time of day.
