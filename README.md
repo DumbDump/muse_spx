@@ -71,3 +71,71 @@ snapshot without starting the loop.
   carried overnight by design.
 - This code was not run against the Tradier API with a real key. Verify
   in dry-run mode first, especially the expirations and chains endpoints.
+
+---
+
+# QQQ double-calendar paper trader (`qqq_paper_trader.py`)
+
+A second worker, same shape as the SPX one but for QQQ double calendars.
+It runs as its own Railway service from the same repo, using the
+`qqq-worker` Procfile process type. Paper-only by construction: the host
+is hardcoded to `sandbox.tradier.com`.
+
+## The rules it implements
+
+- QQQ double calendars only: sell the nearer expiry put and call, buy the
+  next expiry at the same strikes.
+- Strikes $15 each side of the current QQQ price, rounded to the nearest
+  1-point strike.
+- Short leg 6 DTE at entry (any expiry 5-7 DTE qualifies), long leg the
+  next expiry after the short leg (a 6/7 DTE pair when the short is 6
+  DTE). Any weekday pair qualifies.
+- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
+  only when flat. No day skip: it evaluates every poll (3 minutes).
+- Walk-up entry: when the cheapest pair previews at or under $0.80, it
+  bids $0.60 and walks up $0.05 every 30 seconds to $0.80, cancelling
+  and replacing at each step; a fill at any step opens the position.
+  An unfilled cycle cancels and waits 5 minutes before the next cycle.
+  Pairs over $0.80 are logged with their actual price and retried
+  next poll.
+- 10 contracts per trade (see CONTRACTS), one position at a time.
+- Exit at a 10% gain on the debit basis. There is no end-of-day forced
+  close: a position that never reaches 10% stays open and blocks new
+  entries until it does.
+- No preview step: when the rules say enter or exit, the order is placed
+  directly. Every placement is logged immediately.
+
+## Why 6/7 DTE, not 6/12
+
+The original spec was sell 6 DTE / buy 12 DTE with a $0.80 ceiling.
+Tested against the live sandbox chain on 2026-11-07 (QQQ $656.10): the
+6/12 pair (short Nov 16 / long Nov 20, 641P/671C) modeled at a $6.12
+debit, and strike width barely moves it ($5-wide $6.59, $10 $6.41,
+$15 $6.12, $20 $5.79). The 6-day expiry gap is the driver — the SPX
+worker's gap is 1 day. A 6/7 DTE pair (next expiry) is the only variant
+that gets near $0.80: roughly $1.19 at the elevated post-crash vol of
+Nov 7 (VIX 25.64, 9-day gauge 27.18), ~$0.66 at normal ~20% vol. The
+user chose 6/7 on 2026-11-07.
+
+## Deploy on Railway
+
+1. Push `qqq_paper_trader.py` and the updated `Procfile` to the repo.
+2. In the same Railway project, add a second service from the repo and
+   set its start command to the `qqq-worker` process type
+   (`python qqq_paper_trader.py`). It needs its own environment
+   variables — do not share the SPX service's:
+   - `TRADIER_API_KEY` (required): a Tradier SANDBOX (paper) API key.
+   - `ENABLE_TRADING` (default `0`): set to `1` only when you want real
+     paper orders placed. Deploy with dry-run first.
+   - `CONTRACTS` (default `10`): contracts per trade, clamped to 1-10.
+   - `MAX_DEBIT` (default `0.80`): the debit ceiling per share and the
+     top of the walk-up ladder.
+   - `WALK_START` (default `0.60`): the opening bid of a walk-up cycle.
+   - `WALK_STEP` (default `0.05`): the price bump every 30 seconds.
+   - `STRIKE_WIDTH` (default `15`): dollars each side of QQQ.
+   - `POLL_SECONDS` (default `180`): loop interval.
+3. Orders are tagged `muse-qqq`, so the QQQ worker never cancels or
+   collides with the SPX worker's `muse-spx` orders. Both workers trade
+   the same paper account: they each enforce one position at a time for
+   themselves, but they can each hold a position at the same time (one
+   SPX calendar and one QQQ calendar).
