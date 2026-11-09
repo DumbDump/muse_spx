@@ -29,10 +29,15 @@ Implements one fixed rule set, nothing else. It mirrors the SPX worker
   (60 seconds by default) so the 10% exit fires close to the line;
   while flat it polls every POLL_SECONDS (3 minutes).
 - 10 contracts per trade, one position at a time.
-- Exit at a 10% gain on the debit basis (the position is closed when its
-  value reaches 110% of the debit paid). There is no end-of-day forced
-  close: a position that never reaches 10% stays open (and blocks new
-  entries) until it does.
+- Exit at a 10% gain on the debit basis: as soon as an entry fills, the
+  worker places a GTC credit order to close the position at 110% of the
+  debit actually paid, so the exit triggers the moment the market touches
+  it — even between polls or overnight. The poll-based 10% check stays
+  as a fallback for when no take-profit order is working. The standing
+  order caps the gain at exactly 10%: it will not capture an overshoot
+  above the line the way a poll-time close at the mid could. There is no
+  end-of-day forced close: a position that never reaches 10% stays open
+  (and blocks new entries) until it does.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement and fill is logged immediately.
 - Every order carries a tag ("muse-qqq" by default, overridable with
@@ -325,7 +330,7 @@ def has_blocking_pending_order(account, legs):
     return False, None
 
 
-def place_order(account, order_type, price, legs):
+def place_order(account, order_type, price, legs, duration="day"):
     """legs: list of (side, symbol, qty). Returns the API response dict.
     Never creates a second pending order: if a colliding order is already
     pending, the placement is skipped and logged."""
@@ -338,7 +343,7 @@ def place_order(account, order_type, price, legs):
         "class": "multileg",
         "symbol": "QQQ",
         "type": order_type,
-        "duration": "day",
+        "duration": duration,
         "price": "%.2f" % price,
         "tag": ORDER_TAG,
     }
@@ -375,15 +380,48 @@ def position_value_and_basis(account):
     return value, basis, legs
 
 
+def close_legs_for(legs):
+    """Closing legs for open legs: buy back shorts, sell longs."""
+    out = []
+    for leg in legs:
+        side = "buy_to_close" if float(leg["quantity"]) < 0 else "sell_to_close"
+        out.append((side, leg["symbol"], abs(int(leg["quantity"]))))
+    return out
+
+
+def place_take_profit(account, legs, basis):
+    """Place a GTC credit order to close the position at a 10% gain.
+
+    The order sits at 110% of the debit basis, so the exit triggers the
+    moment the market touches it — even between polls, overnight, or
+    across a restart. Returns True when a take-profit order is now
+    working (already pending or just placed), False when nothing was
+    placed (dry-run, or placement failed and the caller should retry
+    next poll). Silent when an order is already working, so the
+    per-poll check does not spam the log."""
+    contracts = max(abs(int(leg["quantity"])) for leg in legs)
+    target = round(basis * 1.10 / (contracts * 100.0), 2)
+    close_legs = close_legs_for(legs)
+    blocked, _ = has_blocking_pending_order(account, close_legs)
+    if blocked:
+        return True
+    resp = place_order(account, "credit", target, close_legs, duration="gtc")
+    if resp.get("blocked"):
+        return True
+    if resp.get("dry_run"):
+        return False
+    order = resp.get("order", resp)
+    log("take-profit: placed GTC credit order id=%s at %.2f (10%% on basis %.2f)"
+        % (order.get("id"), target, basis))
+    return True
+
+
 def close_position(account, legs):
     """Build and place the closing order for the given open legs."""
     value, basis, _ = position_value_and_basis(account)
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     credit = round(value / (contracts * 100.0), 2)
-    close_legs = []
-    for leg in legs:
-        side = "buy_to_close" if float(leg["quantity"]) < 0 else "sell_to_close"
-        close_legs.append((side, leg["symbol"], abs(int(leg["quantity"]))))
+    close_legs = close_legs_for(legs)
     log("closing: value=%.2f basis=%.2f unrealized=%.2f credit=%.2f"
         % (value, basis, value - basis, credit))
     return place_order(account, "credit", credit, close_legs)
@@ -543,10 +581,17 @@ def run_once():
                 flat_state = "waiting for window"
             log(heartbeat_line(now, legs, value, basis, qqq_txt, flat_state))
             if legs:
+                # Keep a standing take-profit in place: a GTC credit order
+                # at 110% of basis. This covers restarts and positions
+                # entered before this code shipped; it is silent when an
+                # order is already working.
+                if basis > 0:
+                    place_take_profit(account, legs, basis)
                 unrealized = value - basis
-                # 10% gain exit, any time of day. This is the only exit:
-                # there is no end-of-day forced close, so a position that
-                # never reaches 10% stays open (and blocks new entries).
+                # 10% gain exit, any time of day. This is the fallback
+                # for when no take-profit order is working: there is no
+                # end-of-day forced close, so a position that never
+                # reaches 10% stays open (and blocks new entries).
                 if basis > 0 and unrealized >= 0.10 * basis:
                     log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, basis))
                     close_position(account, legs)
@@ -577,7 +622,16 @@ def run_once():
                         log("entry: QQQ %.2f short %s / long %s %dP/%dC modeled debit %.2f x %d"
                             % (qqq, short_exp, long_exp, put, call, debit, CONTRACTS))
                         filled = run_walkup_cycle(account, short_exp, long_exp, put, call, debit)
-                        if not filled:
+                        if filled:
+                            # Place the take-profit immediately: a GTC
+                            # credit order at 110% of the debit actually
+                            # paid. If the fill has not shown in
+                            # positions yet, the per-poll check above
+                            # places it on the next poll.
+                            _, fill_basis, fill_legs = position_value_and_basis(account)
+                            if fill_legs and fill_basis > 0:
+                                place_take_profit(account, fill_legs, fill_basis)
+                        else:
                             next_cycle_time = datetime.now(TZ) + timedelta(minutes=5)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)

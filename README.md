@@ -103,9 +103,15 @@ is hardcoded to `sandbox.tradier.com`.
   seconds) so the 10% exit fires close to the line; while flat it
   polls every POLL_SECONDS (3 minutes).
 - 10 contracts per trade (see CONTRACTS), one position at a time.
-- Exit at a 10% gain on the debit basis. There is no end-of-day forced
-  close: a position that never reaches 10% stays open and blocks new
-  entries until it does.
+- Exit at a 10% gain on the debit basis. As soon as an entry fills, it
+  places a GTC credit order to close the position at 110% of the debit
+  paid (e.g. $2.01/share on a $1.83 entry), so the exit triggers the
+  moment the market touches it — even between polls or overnight. The
+  poll-based 10% exit is the fallback if no take-profit order is
+  working. The standing order caps the gain at exactly 10%: it will
+  not capture an overshoot above the line. There is no end-of-day
+  forced close: a position that never reaches 10% stays open and
+  blocks new entries until it does.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement is logged immediately.
 
