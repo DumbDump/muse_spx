@@ -92,12 +92,16 @@ is hardcoded to `sandbox.tradier.com`.
   DTE). Any weekday pair qualifies.
 - Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
   only when flat. No day skip: it evaluates every poll (3 minutes).
-- Walk-up entry: when the cheapest pair previews at or under $0.80, it
-  bids $0.60 and walks up $0.05 every 30 seconds to $0.80, cancelling
-  and replacing at each step; a fill at any step opens the position.
-  An unfilled cycle cancels and waits 5 minutes before the next cycle.
-  Pairs over $0.80 are logged with their actual price and retried
-  next poll.
+- Walk-up entry: when the cheapest pair previews at or under
+  MAX_DEBIT, it bids from max(WALK_START, modeled debit minus
+  WALK_START_OFFSET) and walks up WALK_STEP every 30 seconds to
+  MAX_DEBIT, cancelling and replacing at each step; a fill at any step
+  opens the position. An unfilled cycle cancels and waits 5 minutes
+  before the next cycle. Pairs over MAX_DEBIT are logged with their
+  actual price and retried next poll.
+- While holding a position it polls every HOLD_POLL_SECONDS (60
+  seconds) so the 10% exit fires close to the line; while flat it
+  polls every POLL_SECONDS (3 minutes).
 - 10 contracts per trade (see CONTRACTS), one position at a time.
 - Exit at a 10% gain on the debit basis. There is no end-of-day forced
   close: a position that never reaches 10% stays open and blocks new
@@ -130,10 +134,16 @@ user chose 6/7 on 2026-11-07.
    - `CONTRACTS` (default `10`): contracts per trade, clamped to 1-10.
    - `MAX_DEBIT` (default `0.80`): the debit ceiling per share and the
      top of the walk-up ladder.
-   - `WALK_START` (default `0.60`): the opening bid of a walk-up cycle.
+   - `WALK_START` (default `0.60`): the floor of the opening bid of a
+     walk-up cycle; the actual start is max(WALK_START, modeled debit
+     minus WALK_START_OFFSET).
+   - `WALK_START_OFFSET` (default `0.30`): how far below the modeled
+     debit a walk-up cycle starts.
    - `WALK_STEP` (default `0.05`): the price bump every 30 seconds.
    - `STRIKE_WIDTH` (default `15`): dollars each side of QQQ.
-   - `POLL_SECONDS` (default `180`): loop interval.
+   - `POLL_SECONDS` (default `180`): loop interval while flat.
+   - `HOLD_POLL_SECONDS` (default `60`): loop interval while holding
+     a position, so the 10% exit fires close to the line.
 3. Orders are tagged `muse-qqq`, so the QQQ worker never cancels or
    collides with the SPX worker's `muse-spx` orders. Both workers trade
    the same paper account: they each enforce one position at a time for

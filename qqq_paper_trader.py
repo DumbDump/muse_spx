@@ -16,11 +16,18 @@ Implements one fixed rule set, nothing else. It mirrors the SPX worker
 - Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
 - Walk-up entry, no day skip: while flat and in the window, the worker
   evaluates every poll (3 minutes). When the cheapest pair previews at
-  or under $0.80, it bids $0.60 and walks up $0.05 every 30 seconds to
-  $0.80, cancelling and replacing at each step; a fill at any step
-  opens the position. An unfilled cycle cancels and waits 5 minutes
-  before the next cycle. Pairs over $0.80 are logged with their actual
+  or under MAX_DEBIT, it bids from max(WALK_START, modeled debit minus
+  WALK_START_OFFSET) and walks up WALK_STEP every 30 seconds to
+  MAX_DEBIT, cancelling and replacing at each step; a fill at any step
+  opens the position. Starting near the modeled debit (instead of a
+  fixed low bid) skips steps that could never fill: on Mon Nov 9 the
+  first cycle climbed 26 steps from $0.60 to a $1.85 fill against a
+  $1.89 model. An unfilled cycle cancels and waits 5 minutes
+  before the next cycle. Pairs over MAX_DEBIT are logged with their actual
   price and retried next poll.
+- While holding a position, the worker polls every HOLD_POLL_SECONDS
+  (60 seconds by default) so the 10% exit fires close to the line;
+  while flat it polls every POLL_SECONDS (3 minutes).
 - 10 contracts per trade, one position at a time.
 - Exit at a 10% gain on the debit basis (the position is closed when its
   value reaches 110% of the debit paid). There is no end-of-day forced
@@ -93,6 +100,8 @@ CONTRACTS = max(1, min(10, int(os.environ.get("CONTRACTS", "10"))))
 MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "0.80"))
 WALK_START = float(os.environ.get("WALK_START", "0.60"))
 WALK_STEP = float(os.environ.get("WALK_STEP", "0.05"))
+WALK_START_OFFSET = float(os.environ.get("WALK_START_OFFSET", "0.30"))
+HOLD_POLL_SECONDS = int(os.environ.get("HOLD_POLL_SECONDS", "60"))
 STRIKE_WIDTH = float(os.environ.get("STRIKE_WIDTH", "15"))
 SHORT_DTE_MIN = int(os.environ.get("SHORT_DTE_MIN", "5"))
 SHORT_DTE_MAX = int(os.environ.get("SHORT_DTE_MAX", "7"))
@@ -400,8 +409,9 @@ def cancel_order(account, order_id):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def run_walkup_cycle(account, short_exp, long_exp, put, call):
-    """Bid a pair from WALK_START up to MAX_DEBIT in WALK_STEP steps.
+def run_walkup_cycle(account, short_exp, long_exp, put, call, modeled_debit):
+    """Bid a pair from max(WALK_START, modeled debit - WALK_START_OFFSET)
+    up to MAX_DEBIT in WALK_STEP steps.
 
     Places a debit limit order, waits 30 seconds, and if it is still
     working, cancels it and re-places one step higher. Returns True when
@@ -416,9 +426,12 @@ def run_walkup_cycle(account, short_exp, long_exp, put, call):
         ("buy_to_open", option_symbol(long_exp, put, "P"), CONTRACTS),
         ("buy_to_open", option_symbol(long_exp, call, "C"), CONTRACTS),
     ]
-    log("walk-up: cycle starting short %s / long %s %dP/%dC"
-        % (short_exp, long_exp, put, call))
-    price = WALK_START
+    log("walk-up: cycle starting short %s / long %s %dP/%dC from %.2f "
+        "(modeled %.2f)"
+        % (short_exp, long_exp, put, call,
+           max(WALK_START, round(modeled_debit - WALK_START_OFFSET, 2)),
+           modeled_debit))
+    price = max(WALK_START, round(modeled_debit - WALK_START_OFFSET, 2))
     while price <= MAX_DEBIT + 1e-9:
         price = round(price, 2)
         resp = place_order(account, "debit", price, legs)
@@ -493,6 +506,7 @@ def run_once():
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run", CONTRACTS))
     last_pnl_day = {}
     next_cycle_time = None
+    holding = False
     while True:
         try:
             now = datetime.now(TZ)
@@ -510,6 +524,7 @@ def run_once():
                     pnl_snapshot(account)
                     last_pnl_day[hour] = today
             value, basis, legs = position_value_and_basis(account)
+            holding = bool(legs)
             # Heartbeat every poll: one short line so the log always shows
             # the worker is alive and what it is doing.
             try:
@@ -561,12 +576,14 @@ def run_once():
                         short_exp, long_exp, put, call, debit = pair
                         log("entry: QQQ %.2f short %s / long %s %dP/%dC modeled debit %.2f x %d"
                             % (qqq, short_exp, long_exp, put, call, debit, CONTRACTS))
-                        filled = run_walkup_cycle(account, short_exp, long_exp, put, call)
+                        filled = run_walkup_cycle(account, short_exp, long_exp, put, call, debit)
                         if not filled:
                             next_cycle_time = datetime.now(TZ) + timedelta(minutes=5)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)
-        time.sleep(POLL_SECONDS)
+        # Poll faster while holding a position so the 10% exit fires
+        # close to the line; poll slower while flat.
+        time.sleep(HOLD_POLL_SECONDS if holding else POLL_SECONDS)
     return 0
 
 
