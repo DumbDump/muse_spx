@@ -440,7 +440,13 @@ def close_position(account, legs):
     would otherwise block the close, since the take-profit carries the
     same leg symbols. If the cancel fails, the close is skipped and the
     next poll retries. Returns early when the position is already gone
-    (e.g. the take-profit filled just before this poll)."""
+    (e.g. the take-profit filled just before this poll).
+
+    A position that has lost more than its debit is worth less than
+    zero: closing it costs money, so the close is a DEBIT order for the
+    absolute value, not a credit order at a negative price — Tradier
+    rejects negative prices, which left the Nov 10 SPX position with no
+    working order after its stop-loss fired."""
     value, basis, fresh_legs = position_value_and_basis(account)
     if not fresh_legs:
         log("closing: position already closed, nothing to do")
@@ -458,11 +464,15 @@ def close_position(account, legs):
             log("closing: cancel of order %s failed (%s), close skipped, will retry"
                 % (blocking_id, exc))
             return {"blocked": True, "blocking_order_id": blocking_id}
-    log("closing: value=%.2f basis=%.2f unrealized=%.2f credit=%.2f"
-        % (value, basis, value - basis, credit))
+    if credit < 0:
+        order_type, price = "debit", -credit
+    else:
+        order_type, price = "credit", max(credit, 0.01)
+    log("closing: value=%.2f basis=%.2f unrealized=%.2f %s=%.2f"
+        % (value, basis, value - basis, order_type, price))
     # exclude_order_id: the cancel above just removed this order, but a
     # stale feed may still list it — do not let it block its own close.
-    return place_order(account, "credit", credit, close_legs,
+    return place_order(account, order_type, price, close_legs,
                        exclude_order_id=blocking_id if blocked else None)
 
 
