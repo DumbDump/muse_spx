@@ -26,30 +26,22 @@ Nasdaq-100 names by market cap, on the paper account only:
   (NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AVGO, META, MU, AMD) qualify
   most days.
 - Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
-- Walk-up entry, no day skip: while a ticker is flat and in the window,
-  the worker evaluates it every poll. When the cheapest pair previews at
-  or under the ceiling, it bids from 70% of the modeled debit
-  (WALK_START_FRACTION) and walks up 5% of the modeled debit per step
-  (WALK_STEP_FRACTION, floors $0.05 start / $0.01 step) to the ceiling,
-  cancelling and replacing at each step; a fill at any step opens the
-  position. An unfilled cycle cancels and waits 5 minutes before the
-  next cycle for that ticker. Pairs over the ceiling are logged with
-  their actual price and retried next poll.
-- Execute at the bid: the walk-up never bids above the spread's bid
-  (long-leg bids minus short-leg asks, read off the same chains) or the
-  ceiling, whichever is lower — we are the bidder, never crossing to the
-  ask. If the 70% start is already above the bid, the first order goes
-  in at the bid. A fill at the bid may take longer than paying the mid;
-  that is the point.
+- One bid per cycle, at the spread's bid: while a ticker is flat and
+  in the window, the worker evaluates it every poll and places a single
+  debit limit order at the spread's bid (long-leg bids minus short-leg
+  asks, read off the same chains). There is no ceiling anymore —
+  removed Nov 10 at the user's instruction: the bid is the price, full
+  stop — and no walk-up: the price only ever moves once per poll cycle.
+  A bid that does not fill is cancelled next cycle and re-placed at the
+  then-current bid. A bid left working when its pair stops qualifying
+  is cancelled as stale. A fill shows up as a position next poll, and
+  the per-poll check then places the GTC take-profit at 110% of the
+  debit paid.
 - Liquidity gate: a candidate pair is rejected when any of its four
   legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
   and the skip line reports "low-volume". Deep OTM legs show volume 0
   in the sandbox; the floor keeps the worker out of names nobody is
   trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
-- Ceiling is a fraction of the underlying price (MAX_DEBIT_FRACTION,
-  default 0.0025 = 0.25%): about $0.47/share for NVDA at $187 and
-  $3.54 for ASML at $1,418. A flat dollar ceiling would systematically
-  exclude the expensive names, so the ceiling scales with price.
 - 1 contract per trade (CONTRACTS).
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
   worker places a GTC credit order to close the position at 110% of the
@@ -150,6 +142,11 @@ WALK_START_FRACTION = float(os.environ.get("WALK_START_FRACTION", "0.70"))
 WALK_STEP_FRACTION = float(os.environ.get("WALK_STEP_FRACTION", "0.05"))
 WALK_START_FLOOR = float(os.environ.get("WALK_START_FLOOR", "0.05"))
 WALK_STEP_FLOOR = float(os.environ.get("WALK_STEP_FLOOR", "0.01"))
+# NOTE: MAX_DEBIT_FRACTION, the WALK_* vars and COOLDOWN_SECONDS are
+# retired: the ceiling was removed Nov 10 (the bid is the price) and
+# the walk-up was replaced by one bid per cycle. The vars stay defined
+# so an old Railway env does not break the import, but nothing reads
+# them anymore.
 HOLD_POLL_SECONDS = int(os.environ.get("HOLD_POLL_SECONDS", "120"))
 SHORT_DTE_MIN = int(os.environ.get("SHORT_DTE_MIN", "5"))
 SHORT_DTE_MAX = int(os.environ.get("SHORT_DTE_MAX", "7"))
@@ -322,23 +319,20 @@ def _nearest_strike(target, available):
 
 
 def find_best_pair(ticker, price, expirations):
-    """Return (qualifying, cheapest, ceiling, reason): the cheapest pair
-    at or under the ceiling (or None), plus the cheapest pair at any
-    debit (or None), plus the ceiling itself, plus a skip reason (or
-    None when a pair was evaluated).
+    """Return (pair, reason): the cheapest volume-passing pair for this
+    ticker, or (None, reason) when it sits out.
 
-    Each candidate is (short_exp, long_exp, put_strike, call_strike,
-    debit, bid): debit is the mid-based modeled cost, bid is the
-    spread's bid — what the position could be sold for right now
-    (long-leg bids minus short-leg asks). The walk-up caps at the bid,
-    so entries execute at the bid and never cross to the ask.
+    A pair is (short_exp, long_exp, put_strike, call_strike, debit,
+    bid): debit is the mid-based modeled cost, bid is the spread's bid
+    — what the position could be sold for right now (long-leg bids
+    minus short-leg asks). The entry places a single order at the bid;
+    there is no ceiling anymore (removed Nov 10 at the user's
+    instruction: the bid is the price, full stop). The cheapest pair is
+    the one to bid, whatever its modeled debit.
 
-    The ceiling is MAX_DEBIT_FRACTION of the underlying price, so it
-    scales from about $0.47 for NVDA to about $3.54 for ASML. Targets
-    are price +/- STRIKE_WIDTH_PCT, snapped to the nearest strike
-    actually listed in both chains. The long leg is the next expiry
-    after the short leg. The cheapest pair is what the skip line prints,
-    so the log shows the actual price even on a skipped day.
+    Targets are price +/- STRIKE_WIDTH_PCT, snapped to the nearest
+    strike actually listed in both chains. The long leg is the next
+    expiry after the short leg.
 
     Liquidity gate: a candidate is rejected when any of its four legs
     traded fewer than MIN_LEG_VOLUME contracts today (default 100) —
@@ -350,12 +344,10 @@ def find_best_pair(ticker, price, expirations):
     QQQ worker raises here because it has one ticker, but this worker
     has twenty, and one bad ticker must not block the other nineteen.
     The reason string tells the skip line why the ticker sat out."""
-    ceiling = round(MAX_DEBIT_FRACTION * price, 2)
     put_target = price * (1.0 - STRIKE_WIDTH_PCT)
     call_target = price * (1.0 + STRIKE_WIDTH_PCT)
     today = datetime.now(TZ).date()
     best = None
-    cheapest = None
     saw_window = False
     saw_chains = False
     saw_low_volume = False
@@ -414,21 +406,19 @@ def find_best_pair(ticker, price, expirations):
             continue
         candidate = (short_exp, long_exp, put_strike, call_strike,
                      round(debit, 2), round(bid, 2))
-        if cheapest is None or candidate[4] < cheapest[4]:
-            cheapest = candidate
-        if debit <= ceiling and (best is None or debit < best[4]):
+        if best is None or candidate[4] < best[4]:
             best = candidate
     if not saw_window:
-        return None, None, ceiling, "no-5-7-DTE"
+        return None, "no-5-7-DTE"
     if not saw_chains:
         # An expiry qualified but the endpoint returned no chain data: a
         # transient outage for this ticker, not a reason to stop the
         # other nineteen.
         log("%s: no option chains data from Tradier, skipping this poll" % ticker)
-        return None, None, ceiling, "no-chain-data"
-    if best is None and cheapest is None and saw_low_volume:
-        return None, None, ceiling, "low-volume"
-    return best, cheapest, ceiling, None
+        return None, "no-chain-data"
+    if best is None and saw_low_volume:
+        return None, "low-volume"
+    return best, None
 
 
 def get_pending_orders(account):
@@ -659,88 +649,64 @@ def cancel_order(account, order_id):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def run_walkup_cycle(account, ticker, short_exp, long_exp, put, call,
-                     modeled_debit, ceiling, bid):
-    """Bid a pair from 70% of the modeled debit up to the spread's bid.
-
-    Places a debit limit order, waits 30 seconds, and if it is still
-    working, cancels it and re-places one step higher (5% of the modeled
-    debit per step, floors $0.05 start / $0.01 step). The walk never
-    goes above the spread's bid (or the ceiling, whichever is lower):
-    entries execute at the bid — we are the bidder, never crossing to
-    the ask. If the start is already above the bid, the first order
-    goes in at the bid. Returns True when the order filled (or
-    partially filled, leaving a position), False when the walk reached
-    the cap unfilled or was blocked. A cycle started inside the entry
-    window is allowed to finish even if the window ends mid-cycle.
-    Only the worker's own tagged order is ever cancelled, and only
-    after the one-pending check passes."""
+def place_bid_order(account, ticker, short_exp, long_exp, put, call, bid):
+    """Place ONE debit limit order at the spread's bid and return its
+    order id (or None when blocked / dry-run). No walk-up: the bid is
+    the price. If it does not fill, the next poll cycle cancels it and
+    re-bids at the then-current bid — the price only ever moves once
+    per cycle, never inside one. Only the worker's own tagged order is
+    ever placed, and place_order enforces at most one pending order
+    per ticker."""
     legs = [
         ("sell_to_open", option_symbol(ticker, short_exp, put, "P"), CONTRACTS),
         ("sell_to_open", option_symbol(ticker, short_exp, call, "C"), CONTRACTS),
         ("buy_to_open", option_symbol(ticker, long_exp, put, "P"), CONTRACTS),
         ("buy_to_open", option_symbol(ticker, long_exp, call, "C"), CONTRACTS),
     ]
-    cap = min(ceiling, bid)
-    start = min(max(WALK_START_FLOOR, round(modeled_debit * WALK_START_FRACTION, 2)),
-                cap)
-    step = max(WALK_STEP_FLOOR, round(modeled_debit * WALK_STEP_FRACTION, 2))
-    log("walk-up: %s cycle starting short %s / long %s %dP/%dC from %.2f "
-        "step %.2f bid cap %.2f (ceiling %.2f, modeled %.2f)"
-        % (ticker, short_exp, long_exp, put, call, start, step, cap, ceiling,
-           modeled_debit))
-    price = start
-    while price <= cap + 1e-9:
-        price = round(price, 2)
-        resp = place_order(account, ticker, "debit", price, legs)
-        if resp.get("blocked"):
-            log("walk-up: %s blocked by an existing pending order, cycle aborted"
-                % ticker)
-            return False
-        if resp.get("dry_run"):
-            return False
-        order = resp.get("order", resp)
-        order_id = order.get("id")
-        if not order_id:
-            log("walk-up: %s order response without id, cycle aborted: %s"
-                % (ticker, resp))
-            return False
-        time.sleep(30)
-        try:
-            status = get_order_status(account, order_id)
-        except Exception as exc:  # noqa: BLE001 - cancel anyway below
-            log("walk-up: %s status check failed (%s), cancelling order %s"
-                % (ticker, exc, order_id))
-            status = None
-        if status == "filled":
-            log("walk-up: %s filled at %.2f (order %s)" % (ticker, price, order_id))
-            return True
-        if status in ("open", "pending", "partially_filled", None):
-            try:
-                cancel_order(account, order_id)
-            except Exception as exc:  # noqa: BLE001 - re-check below
-                log("walk-up: %s cancel of order %s failed (%s)"
-                    % (ticker, order_id, exc))
-            if status == "partially_filled":
-                log("walk-up: %s partially filled at %.2f (order %s), stopping cycle"
-                    % (ticker, price, order_id))
-                return True
-            # Re-check: it may have filled while the cancel was in flight.
-            try:
-                if get_order_status(account, order_id) == "filled":
-                    log("walk-up: %s filled at %.2f (order %s)"
-                        % (ticker, price, order_id))
-                    return True
-            except Exception:
-                pass
-            log("walk-up: %s %.2f unfilled, cancelled, walking up"
-                % (ticker, price))
-        else:
-            log("walk-up: %s order %s ended as %s at %.2f"
-                % (ticker, order_id, status, price))
-        price = round(price + step, 2)
-    log("walk-up: %s reached %.2f unfilled, cycle done" % (ticker, cap))
-    return False
+    log("bid: %s %.2f short %s / long %s %dP/%dC"
+        % (ticker, bid, short_exp, long_exp, put, call))
+    resp = place_order(account, ticker, "debit", bid, legs)
+    if resp.get("blocked"):
+        log("bid: %s blocked by an existing pending order, not placed" % ticker)
+        return None
+    if resp.get("dry_run"):
+        return None
+    order = resp.get("order", resp)
+    order_id = order.get("id")
+    if not order_id:
+        log("bid: %s order response without id, not placed: %s" % (ticker, resp))
+        return None
+    log("bid: %s order %s working at %.2f" % (ticker, order_id, bid))
+    return order_id
+
+
+def cancel_bid_order(account, ticker, order_id):
+    """Cancel a working bid order from a previous cycle. Returns True
+    when the order is gone (cancelled, or already filled — a fill means
+    the position exists and the entry loop will pick it up next poll),
+    False when it is still working and the cancel failed, so the caller
+    leaves it alone and retries next cycle instead of placing a second
+    order."""
+    try:
+        status = get_order_status(account, order_id)
+    except Exception as exc:  # noqa: BLE001 - cancel anyway below
+        log("bid: %s status check failed (%s), cancelling order %s"
+            % (ticker, exc, order_id))
+        status = None
+    if status == "filled":
+        return True
+    if status not in ("open", "pending", "partially_filled", None):
+        # Rejected, expired, or otherwise dead: nothing to cancel.
+        return True
+    try:
+        cancel_order(account, order_id)
+    except Exception as exc:  # noqa: BLE001 - still working, retry later
+        log("bid: %s cancel of order %s failed (%s), leaving it working"
+            % (ticker, order_id, exc))
+        return False
+    log("bid: %s cancelled order %s, will re-bid at the next cycle's bid"
+        % (ticker, order_id))
+    return True
 
 
 def pnl_snapshot(account):
@@ -767,7 +733,11 @@ def run_once():
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run",
            CONTRACTS, len(TICKERS)))
     last_pnl_day = {}
-    cooldown_until = {}
+    # Working bid order per ticker: one single-bid attempt per poll
+    # cycle. A bid that does not fill is cancelled next cycle and
+    # re-placed at the then-current bid — the price only ever moves
+    # once per cycle, never inside one.
+    bid_orders = {}
     holding = False
     while True:
         try:
@@ -789,7 +759,7 @@ def run_once():
                 except Exception as exc:  # noqa: BLE001 - skip this ticker
                     log("%s price unavailable (%s), skipping this poll"
                         % (ticker, exc))
-            # 1) Exits first, for every holding ticker: a walk-up must
+            # 1) Exits first, for every holding ticker: a bid must
             # never delay a stop-loss.
             all_positions = get_positions(account)
             holding_tickers = []
@@ -799,6 +769,9 @@ def run_once():
                 if not legs:
                     continue
                 holding_tickers.append(ticker)
+                # A position means any earlier bid order for this ticker
+                # has filled; drop its tracking.
+                bid_orders.pop(ticker, None)
                 unrealized = value - basis
                 # Loss exit: close at the mid when the position has lost
                 # half the debit (value at or under STOP_LOSS_FRACTION of
@@ -852,51 +825,48 @@ def run_once():
             else:
                 log("heartbeat: flat %d tickers, waiting for window"
                     % len(TICKERS))
-            # 2) Entries for flat tickers in the window. An unfilled
-            # cycle cools down for 5 minutes for that ticker only.
+            # 2) Entries for flat tickers in the window: one bid per
+            # ticker per cycle, at the spread's bid — no ceiling, no
+            # walk-up. An unfilled bid is cancelled next cycle and
+            # re-placed at the new bid; a bid left working when its
+            # pair stops qualifying is cancelled as stale.
             if ENTRY_START <= now.time() < ENTRY_END:
                 skips = []
                 for ticker in TICKERS:
                     if ticker in holding_tickers:
                         continue
-                    if ticker in cooldown_until and now < cooldown_until[ticker]:
-                        continue
                     price = prices.get(ticker)
                     if price is None:
                         continue
-                    pair, cheapest, ceiling, reason = find_best_pair(
+                    pair, reason = find_best_pair(
                         ticker, price, get_expirations(ticker))
+                    prev_id = bid_orders.get(ticker)
                     if pair is None:
-                        if reason == "low-volume":
-                            skips.append("%s low-volume" % ticker)
-                        elif cheapest is not None:
-                            skips.append("%s %.2f>%.2f" % (ticker, cheapest[4], ceiling))
-                        else:
-                            skips.append("%s %s" % (ticker, reason))
-                    else:
-                        short_exp, long_exp, put, call, debit, bid = pair
-                        log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
-                            "bid %.2f ceiling %.2f x %d"
-                            % (ticker, price, short_exp, long_exp, put, call,
-                               debit, bid, ceiling, CONTRACTS))
-                        filled = run_walkup_cycle(
-                            account, ticker, short_exp, long_exp, put, call,
-                            debit, ceiling, bid)
-                        if filled:
-                            # Place the take-profit immediately: a GTC
-                            # credit order at 110% of the debit actually
-                            # paid. If the fill has not shown in
-                            # positions yet, the per-poll check above
-                            # places it on the next poll.
-                            _, fill_basis, fill_legs = position_value_and_basis(
-                                account, ticker)
-                            if fill_legs and fill_basis > 0:
-                                place_take_profit(account, ticker, fill_legs, fill_basis)
-                        else:
-                            cooldown_until[ticker] = (
-                                datetime.now(TZ) + timedelta(seconds=COOLDOWN_SECONDS))
+                        if prev_id:
+                            if cancel_bid_order(account, ticker, prev_id):
+                                bid_orders.pop(ticker, None)
+                        skips.append("%s %s" % (ticker, reason))
+                        continue
+                    short_exp, long_exp, put, call, debit, bid = pair
+                    if prev_id:
+                        if not cancel_bid_order(account, ticker, prev_id):
+                            # Still working and the cancel failed: leave
+                            # it alone, retry next cycle.
+                            continue
+                        bid_orders.pop(ticker, None)
+                    log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
+                        "bid %.2f x %d"
+                        % (ticker, price, short_exp, long_exp, put, call,
+                           debit, bid, CONTRACTS))
+                    order_id = place_bid_order(
+                        account, ticker, short_exp, long_exp, put, call, bid)
+                    if order_id:
+                        # A fill shows up as a position next poll; the
+                        # per-poll check above then places the GTC
+                        # take-profit at 110% of the debit paid.
+                        bid_orders[ticker] = order_id
                 if skips:
-                    log("no entry: best pair over ceiling: %s" % ", ".join(skips))
+                    log("no entry: %s" % ", ".join(skips))
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)
         # Poll faster while holding a position so the 10% exit fires

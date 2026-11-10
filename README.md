@@ -204,29 +204,20 @@ process type. Paper-only by construction: the host is hardcoded to
   most days.
 - Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
   only when that ticker is flat. No day skip: it evaluates every poll.
-- Walk-up entry: when the cheapest pair previews at or under the
-  ceiling, it bids from 70% of the modeled debit (WALK_START_FRACTION)
-  and walks up 5% of the modeled debit per step (WALK_STEP_FRACTION,
-  floors $0.05 start / $0.01 step) to the ceiling, cancelling and
-  replacing at each step; a fill at any step opens the position. An
-  unfilled cycle cancels and waits 5 minutes before the next cycle for
-  that ticker. Pairs over the ceiling are logged with their actual
-  price and retried next poll.
-- Execute at the bid: the walk-up never bids above the spread's bid
-  (long-leg bids minus short-leg asks, read off the same chains) or the
-  ceiling, whichever is lower — we are the bidder, never crossing to
-  the ask. If the 70% start is already above the bid, the first order
-  goes in at the bid. A fill at the bid may take longer than paying the
-  mid; that is the point.
+- Walk-up entry is gone (replaced Nov 10): one bid per cycle, at the
+  spread's bid — no ceiling, no walk-up. While a ticker is flat and in
+  the window, it places a single debit limit order at the spread's bid
+  (long-leg bids minus short-leg asks). The bid is the price, full
+  stop. A bid that does not fill is cancelled next cycle and re-placed
+  at the then-current bid; the price only ever moves once per poll
+  cycle. A bid left working when its pair stops qualifying is
+  cancelled as stale. A fill shows up as a position next poll, and the
+  per-poll check then places the GTC take-profit.
 - Liquidity gate: a candidate pair is rejected when any of its four
   legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
   and the skip line reports "low-volume". Deep OTM legs show volume 0
   in the sandbox; the floor keeps the worker out of names nobody is
   trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
-- Ceiling is a fraction of the underlying price (MAX_DEBIT_FRACTION,
-  default 0.0025 = 0.25%): about $0.47/share for NVDA at $187 and
-  $3.54 for ASML at $1,418. A flat dollar ceiling would systematically
-  exclude the expensive names, so the ceiling scales with price.
 - 1 contract per trade (CONTRACTS), per ticker.
 - Exit at a 10% gain on the debit basis. As soon as an entry fills, it
   places a GTC credit order to close the position at 110% of the debit
