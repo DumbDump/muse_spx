@@ -472,17 +472,26 @@ def get_pending_orders(account):
     return pending
 
 
-def has_blocking_pending_order(account, legs, tag, exclude_id=None):
+def has_blocking_pending_order(account, legs, tag, exclude_id=None, ignore_credit=False):
     """True when this ticker already has a pending order that would collide
     with the given legs: its own tag, or the same leg symbols. Matching on
     leg symbols means the check works even for orders placed before
     tagging, and even if the provider does not echo the tag back. The tag
     is per ticker, so a pending NVDA order never blocks an AMD entry.
     exclude_id skips one order the caller just cancelled, so a stale feed
-    listing it does not block the replacement close."""
+    listing it does not block the replacement close. ignore_credit is
+    True only for debit placements: a credit order is a take-profit for
+    a position, and when the ticker is flat it is stale (the position
+    closed another way) — Tradier may also refuse to cancel it (Nov 10:
+    GTC 41563112 on the SPX worker, HTTP 400 'order not available to be
+    canceled'), so a debit bid must not wait on it. Credit placements
+    (take-profit, credit close) keep the old rule, so no duplicate GTC
+    is ever placed."""
     new_symbols = {symbol for _, symbol, _ in legs}
     for order in get_pending_orders(account):
         if exclude_id is not None and str(order["id"]) == str(exclude_id):
+            continue
+        if ignore_credit and order.get("type") == "credit":
             continue
         if order["tag"] == tag or order["symbols"] == new_symbols:
             return True, order["id"]
@@ -534,7 +543,8 @@ def place_order(account, ticker, order_type, price, legs, duration="day",
     order is already pending, the placement is skipped and logged."""
     tag = tag_for(ticker)
     blocked, blocking_id = has_blocking_pending_order(
-        account, legs, tag, exclude_id=exclude_order_id)
+        account, legs, tag, exclude_id=exclude_order_id,
+        ignore_credit=(order_type == "debit"))
     if blocked:
         log("SKIPPED %s %s order at %.2f: pending order %s already exists"
             % (ticker, order_type, price, blocking_id))
@@ -706,6 +716,46 @@ def cancel_order(account, order_id):
     req.add_header("Authorization", "Bearer %s" % API_KEY)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+_STALE_TAKE_PROFIT_CANCEL_TRIED = set()
+
+
+def cleanup_stale_take_profit_orders(account, ticker):
+    """Best-effort cancel of take-profit (credit) orders left working
+    after their position closed another way (a manual close, or a fill
+    the worker missed). Called for a flat ticker, so a pending credit
+    order for that ticker has no position behind it and is stale. Each
+    order id is attempted once per process run: Tradier may refuse the
+    cancel (Nov 10: GTC 41563112 on the SPX worker, HTTP 400 'order not
+    available to be canceled'), and retrying a refused cancel every
+    cycle would spam the log — the entry path ignores credit orders
+    anyway, so a refused cancel is logged once and the order is left
+    working. Only credit orders whose legs all belong to this ticker
+    are touched (matching is by leg symbols, not by tag: Tradier does
+    not echo the tag back)."""
+    try:
+        pending = get_pending_orders(account)
+    except Exception as exc:  # noqa: BLE001 - retry next cycle
+        log("stale-take-profit cleanup: pending orders read failed (%s)" % exc)
+        return
+    for order in pending:
+        if order.get("type") != "credit":
+            continue
+        symbols = order.get("symbols") or set()
+        if not symbols or {root_of(s) for s in symbols} != {ticker}:
+            continue
+        order_id = str(order["id"])
+        if order_id in _STALE_TAKE_PROFIT_CANCEL_TRIED:
+            continue
+        _STALE_TAKE_PROFIT_CANCEL_TRIED.add(order_id)
+        try:
+            cancel_order(account, order["id"])
+            log("stale-take-profit cleanup: cancelled order %s for %s"
+                % (order["id"], ticker))
+        except Exception as exc:  # noqa: BLE001 - entry path ignores it
+            log("stale-take-profit cleanup: cancel of order %s for %s refused "
+                "(%s), entry path ignores it" % (order["id"], ticker, exc))
 
 
 def place_bid_order(account, ticker, short_exp, long_exp, put, call, bid):
@@ -897,6 +947,13 @@ def run_once():
                 for ticker in TICKERS:
                     if ticker in holding_tickers:
                         continue
+                    # Clean up a stale take-profit for this flat ticker
+                    # before bidding: a credit order left working after
+                    # its position closed another way must not block the
+                    # next bid (the bid path ignores credit orders, but
+                    # the stale order should still be cancelled when
+                    # Tradier allows it).
+                    cleanup_stale_take_profit_orders(account, ticker)
                     price = prices.get(ticker)
                     if price is None:
                         continue
