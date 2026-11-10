@@ -36,7 +36,10 @@ Nasdaq-100 names by market cap, on the paper account only:
   then-current bid. A bid left working when its pair stops qualifying
   is cancelled as stale. A fill shows up as a position next poll, and
   the per-poll check then places the GTC take-profit at 110% of the
-  debit paid.
+  debit paid. The working bid order is tracked in memory, so after a
+  restart the worker re-adopts it from the orders feed (debit orders
+  carrying its per-ticker tag) instead of being blocked by it until
+  it fills or expires at the close.
 - Liquidity gate, two-tier: the SHORT legs (front expiry) must have
   traded at least MIN_LEG_VOLUME contracts today (default 100), and
   the LONG legs (next expiry) at least MIN_LONG_LEG_VOLUME (default
@@ -463,6 +466,7 @@ def get_pending_orders(account):
         pending.append({
             "id": order.get("id"),
             "tag": order.get("tag"),
+            "type": order.get("type"),
             "symbols": symbols,
         })
     return pending
@@ -483,6 +487,36 @@ def has_blocking_pending_order(account, legs, tag, exclude_id=None):
         if order["tag"] == tag or order["symbols"] == new_symbols:
             return True, order["id"]
     return False, None
+
+
+def adopt_working_bid_orders(account, bid_orders):
+    """Adopt working bid orders placed before a restart. bid_orders is
+    in-memory and resets on redeploy, but a day bid order placed
+    before the restart is still working in Tradier; without this the
+    worker would be blocked from bidding (one-pending rule) until that
+    order fills or expires at the close. Only debit orders carrying
+    this worker's per-ticker tag are adopted — the take-profit GTC is
+    a credit order, so it is never mistaken for a bid. A holding
+    ticker's orders are never adopted for entry anyway (the entry loop
+    skips holding tickers). Returns the tickers adopted."""
+    adopted = []
+    try:
+        pending = get_pending_orders(account)
+    except Exception as exc:  # noqa: BLE001 - retry next cycle
+        log("adopt: pending orders read failed (%s)" % exc)
+        return adopted
+    for order in pending:
+        if order.get("type") not in ("debit", None):
+            continue
+        for ticker in TICKERS:
+            if ticker in bid_orders:
+                continue
+            if order.get("tag") == tag_for(ticker):
+                bid_orders[ticker] = order["id"]
+                adopted.append(ticker)
+                log("adopted working bid order %s for %s" % (order["id"], ticker))
+                break
+    return adopted
 
 
 def place_order(account, ticker, order_type, price, legs, duration="day",
@@ -848,6 +882,9 @@ def run_once():
             # re-placed at the new bid; a bid left working when its
             # pair stops qualifying is cancelled as stale.
             if ENTRY_START <= now.time() < ENTRY_END:
+                # Adopt working bid orders after a restart, so the
+                # cancel-and-rebid flow keeps working (see above).
+                adopt_working_bid_orders(account, bid_orders)
                 skips = []
                 for ticker in TICKERS:
                     if ticker in holding_tickers:
