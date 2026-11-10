@@ -13,7 +13,7 @@ Implements one fixed rule set, nothing else. It mirrors the SPX worker
   1-point strike. ($15 is roughly 2.3% of the underlying.)
 - Short leg 6 DTE at entry (any expiry 5-7 DTE qualifies), long leg the
   next expiry after the short leg. Any weekday pair qualifies.
-- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
+- Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
 - Walk-up entry, no day skip: while flat and in the window, the worker
   evaluates every poll (3 minutes). When the cheapest pair previews at
   or under MAX_DEBIT, it bids from max(WALK_START, modeled debit minus
@@ -107,7 +107,7 @@ BASE = "https://%s" % HOST
 API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(10, int(os.environ.get("CONTRACTS", "10"))))
-MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "0.80"))
+MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "1.50"))
 WALK_START = float(os.environ.get("WALK_START", "0.60"))
 WALK_STEP = float(os.environ.get("WALK_STEP", "0.05"))
 WALK_START_OFFSET = float(os.environ.get("WALK_START_OFFSET", "0.30"))
@@ -115,7 +115,7 @@ HOLD_POLL_SECONDS = int(os.environ.get("HOLD_POLL_SECONDS", "60"))
 STRIKE_WIDTH = float(os.environ.get("STRIKE_WIDTH", "15"))
 SHORT_DTE_MIN = int(os.environ.get("SHORT_DTE_MIN", "5"))
 SHORT_DTE_MAX = int(os.environ.get("SHORT_DTE_MAX", "7"))
-ENTRY_START = dtime(6, 45)
+ENTRY_START = dtime(8, 0)
 ENTRY_END = dtime(12, 30)
 COOLDOWN_SECONDS = 300
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "180"))

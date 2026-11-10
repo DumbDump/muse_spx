@@ -12,13 +12,13 @@ Implements one fixed rule set, nothing else:
   5-point strike.
 - Short leg 3-5 DTE at entry, long leg the next expiry after the short leg.
   Any weekday pair qualifies.
-- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
+- Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
 - Walk-up entry, no day skip: while flat and in the window, the worker
   evaluates every poll (3 minutes). When the cheapest pair previews at
-  or under $11.00, it bids $9.00 and walks up $0.10 every 30 seconds to
-  $11.00, cancelling and replacing at each step; a fill at any step
+  or under $12.00, it bids $9.00 and walks up $0.10 every 30 seconds to
+  $12.00, cancelling and replacing at each step; a fill at any step
   opens the position. An unfilled cycle cancels and waits 5 minutes
-  before the next cycle. Pairs over $11.00 are logged with their actual
+  before the next cycle. Pairs over $12.00 are logged with their actual
   price and retried next poll.
 - Max 5 contracts per trade, one position at a time.
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
@@ -97,10 +97,10 @@ BASE = "https://%s" % HOST
 API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(5, int(os.environ.get("CONTRACTS", "5"))))
-MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "11.00"))
+MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "12.00"))
 WALK_START = float(os.environ.get("WALK_START", "9.00"))
 WALK_STEP = float(os.environ.get("WALK_STEP", "0.10"))
-ENTRY_START = dtime(6, 45)
+ENTRY_START = dtime(8, 0)
 ENTRY_END = dtime(12, 30)
 COOLDOWN_SECONDS = 300
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "180"))

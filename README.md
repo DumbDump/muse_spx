@@ -13,13 +13,13 @@ reach a live account.
   5-point strike.
 - Short leg 3-5 DTE at entry, long leg the next expiry after it. Any
   weekday pair qualifies.
-- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
+- Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
   only when flat. No day skip: it evaluates every poll (3 minutes).
-- Walk-up entry: when the cheapest pair previews at or under $11.00, it
-  bids $9.00 and walks up $0.10 every 30 seconds to $11.00, cancelling
+- Walk-up entry: when the cheapest pair previews at or under $12.00, it
+  bids $9.00 and walks up $0.10 every 30 seconds to $12.00, cancelling
   and replacing at each step; a fill at any step opens the position.
   An unfilled cycle cancels and waits 5 minutes before the next cycle.
-  Pairs over $11.00 are logged with their actual price and retried
+  Pairs over $12.00 are logged with their actual price and retried
   next poll.
 - Max 5 contracts per trade (see CONTRACTS), one position at a time.
 - Exit at a 10% gain on the debit basis. As soon as an entry fills, it
@@ -52,7 +52,7 @@ reach a live account.
      mode: it evaluates the rules, logs exactly what it would place, and
      places nothing.
    - `CONTRACTS` (default `5`): contracts per trade, clamped to 1-5.
-   - `MAX_DEBIT` (default `11.00`): the debit ceiling per share and the
+   - `MAX_DEBIT` (default `12.00`): the debit ceiling per share and the
      top of the walk-up ladder.
    - `WALK_START` (default `9.00`): the opening bid of a walk-up cycle.
    - `WALK_STEP` (default `0.10`): the price bump every 30 seconds.
@@ -100,7 +100,7 @@ is hardcoded to `sandbox.tradier.com`.
 - Short leg 6 DTE at entry (any expiry 5-7 DTE qualifies), long leg the
   next expiry after the short leg (a 6/7 DTE pair when the short is 6
   DTE). Any weekday pair qualifies.
-- Entry window 6:45 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
+- Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only,
   only when flat. No day skip: it evaluates every poll (3 minutes).
 - Walk-up entry: when the cheapest pair previews at or under
   MAX_DEBIT, it bids from max(WALK_START, modeled debit minus
@@ -152,7 +152,7 @@ user chose 6/7 on 2026-11-07.
    - `ENABLE_TRADING` (default `0`): set to `1` only when you want real
      paper orders placed. Deploy with dry-run first.
    - `CONTRACTS` (default `10`): contracts per trade, clamped to 1-10.
-   - `MAX_DEBIT` (default `0.80`): the debit ceiling per share and the
+   - `MAX_DEBIT` (default `1.50`): the debit ceiling per share and the
      top of the walk-up ladder.
    - `WALK_START` (default `0.60`): the floor of the opening bid of a
      walk-up cycle; the actual start is max(WALK_START, modeled debit
