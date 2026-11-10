@@ -292,27 +292,37 @@ def _nearest_strike(target, available):
 
 
 def find_best_pair(ticker, price, expirations):
-    """Return (qualifying, cheapest, ceiling): the cheapest pair at or
-    under the ceiling (or None), plus the cheapest pair at any debit (or
-    None when no candidate had full chain data), plus the ceiling itself.
+    """Return (qualifying, cheapest, ceiling, reason): the cheapest pair
+    at or under the ceiling (or None), plus the cheapest pair at any
+    debit (or None), plus the ceiling itself, plus a skip reason (or
+    None when a pair was evaluated).
 
     The ceiling is MAX_DEBIT_FRACTION of the underlying price, so it
     scales from about $0.47 for NVDA to about $3.54 for ASML. Targets
     are price +/- STRIKE_WIDTH_PCT, snapped to the nearest strike
     actually listed in both chains. The long leg is the next expiry
     after the short leg. The cheapest pair is what the skip line prints,
-    so the log shows the actual price even on a skipped day."""
+    so the log shows the actual price even on a skipped day.
+
+    Never raises: a ticker with no expiry in the 5-7 DTE window (the
+    normal state for Friday-only names on Tue-Thu, and for AZN almost
+    always) or with no chain data must not abort the whole cycle — the
+    QQQ worker raises here because it has one ticker, but this worker
+    has twenty, and one bad ticker must not block the other nineteen.
+    The reason string tells the skip line why the ticker sat out."""
     ceiling = round(MAX_DEBIT_FRACTION * price, 2)
     put_target = price * (1.0 - STRIKE_WIDTH_PCT)
     call_target = price * (1.0 + STRIKE_WIDTH_PCT)
     today = datetime.now(TZ).date()
     best = None
     cheapest = None
+    saw_window = False
     saw_chains = False
     for i, short_exp in enumerate(expirations):
         dte = (short_exp - today).days
         if dte < SHORT_DTE_MIN or dte > SHORT_DTE_MAX:
             continue
+        saw_window = True
         if i + 1 >= len(expirations):
             continue
         long_exp = expirations[i + 1]
@@ -346,12 +356,15 @@ def find_best_pair(ticker, price, expirations):
             cheapest = candidate
         if debit <= ceiling and (best is None or debit < best[4]):
             best = candidate
+    if not saw_window:
+        return None, None, ceiling, "no-5-7-DTE"
     if not saw_chains:
-        # No chain data at all: a transient endpoint outage, not a "no
-        # qualifying pair" day. Raise so the poll retries instead of
-        # marking today skipped.
-        raise ValueError("no option chains data from Tradier for %s" % ticker)
-    return best, cheapest, ceiling
+        # An expiry qualified but the endpoint returned no chain data: a
+        # transient outage for this ticker, not a reason to stop the
+        # other nineteen.
+        log("%s: no option chains data from Tradier, skipping this poll" % ticker)
+        return None, None, ceiling, "no-chain-data"
+    return best, cheapest, ceiling, None
 
 
 def get_pending_orders(account):
@@ -781,13 +794,13 @@ def run_once():
                     price = prices.get(ticker)
                     if price is None:
                         continue
-                    pair, cheapest, ceiling = find_best_pair(
+                    pair, cheapest, ceiling, reason = find_best_pair(
                         ticker, price, get_expirations(ticker))
                     if pair is None:
                         if cheapest is not None:
                             skips.append("%s %.2f>%.2f" % (ticker, cheapest[4], ceiling))
                         else:
-                            skips.append("%s no-chain-data" % ticker)
+                            skips.append("%s %s" % (ticker, reason))
                     else:
                         short_exp, long_exp, put, call, debit = pair
                         log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
