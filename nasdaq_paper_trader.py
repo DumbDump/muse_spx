@@ -163,7 +163,7 @@ SHORT_DTE_MAX = int(os.environ.get("SHORT_DTE_MAX", "7"))
 ENTRY_START = dtime(8, 0)
 ENTRY_END = dtime(12, 30)
 COOLDOWN_SECONDS = 300
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "180"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))
 STOP_LOSS_FRACTION = float(os.environ.get("STOP_LOSS_FRACTION", "0.50"))
 ORDER_TAG_PREFIX = os.environ.get("ORDER_TAG_PREFIX", "muse-nasdaq")
 

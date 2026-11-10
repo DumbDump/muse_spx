@@ -240,7 +240,8 @@ process type. Paper-only by construction: the host is hardcoded to
   starts in a cycle, so a walk-up can never delay a stop-loss.
 - While holding any position it polls every HOLD_POLL_SECONDS (120
   seconds) so exits fire close to the line; while flat it polls every
-  POLL_SECONDS (180 seconds).
+  POLL_SECONDS (600 seconds / 10 minutes) — one bid per cycle, so a
+  bid is refreshed at most every 10 minutes.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement is logged immediately.
 
@@ -259,13 +260,11 @@ process type. Paper-only by construction: the host is hardcoded to
    - `TICKERS` (default the 20 above): comma-separated tickers.
    - `CONTRACTS` (default `1`): contracts per trade, clamped to 1-10.
    - `STRIKE_WIDTH_PCT` (default `0.02`): fraction each side of price.
-   - `MAX_DEBIT_FRACTION` (default `0.0025`): ceiling per share as a
-     fraction of the underlying price.
-   - `WALK_START_FRACTION` (default `0.70`): walk-up starts at 70% of
-     the modeled debit.
-   - `WALK_STEP_FRACTION` (default `0.05`): step per 30 seconds, as a
-     fraction of the modeled debit.
-   - `POLL_SECONDS` (default `180`): loop interval while flat.
+   - `MIN_LEG_VOLUME` (default `100`): minimum contracts traded today
+     for a SHORT (front-expiry) leg; `MIN_LONG_LEG_VOLUME` (default
+     `10`): the same floor for a LONG (next-expiry) leg.
+   - `POLL_SECONDS` (default `600`): loop interval while flat — one
+     bid per cycle, so a bid is refreshed at most every 10 minutes.
    - `HOLD_POLL_SECONDS` (default `120`): loop interval while holding
      any position, so exits fire close to the line.
 3. Orders are tagged `muse-nasdaq-<TICKER>`, so this worker never
