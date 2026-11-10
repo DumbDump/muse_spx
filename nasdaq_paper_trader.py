@@ -37,11 +37,13 @@ Nasdaq-100 names by market cap, on the paper account only:
   is cancelled as stale. A fill shows up as a position next poll, and
   the per-poll check then places the GTC take-profit at 110% of the
   debit paid.
-- Liquidity gate: a candidate pair is rejected when any of its four
-  legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
-  and the skip line reports "low-volume". Deep OTM legs show volume 0
-  in the sandbox; the floor keeps the worker out of names nobody is
-  trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
+- Liquidity gate, two-tier: the SHORT legs (front expiry) must have
+  traded at least MIN_LEG_VOLUME contracts today (default 100), and
+  the LONG legs (next expiry) at least MIN_LONG_LEG_VOLUME (default
+  10). Volume concentrates in the front expiry — AAPL's Nov 18 legs
+  traded 15 and 74 while the Nov 16 legs traded 200 and 2,791 — so one
+  floor on all four legs would block liquid names outright. The skip
+  line reports "low-volume" when a candidate fails the gate.
 - 1 contract per trade (CONTRACTS).
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
   worker places a GTC credit order to close the position at 110% of the
@@ -137,7 +139,15 @@ MAX_DEBIT_FRACTION = float(os.environ.get("MAX_DEBIT_FRACTION", "0.0025"))
 # worker out of names nobody is trading while passing liquid names
 # (AAPL Nov 16 ATM legs run 100-2,700). Env-tunable: raise it to
 # tighten, lower it to let thinner names in.
+# The floor is two-tier because volume concentrates in the front
+# expiry: the SHORT legs (front expiry) need MIN_LEG_VOLUME, but the
+# LONG legs (next expiry) are structurally thinner — AAPL's Nov 18
+# 342.5P/355C traded 15 and 74 contracts while the Nov 16 legs traded
+# 200 and 2,791 — so they only need MIN_LONG_LEG_VOLUME (default 10):
+# they must trade at all, not sit dead. A 100 floor on all four legs
+# blocked AAPL entirely on Nov 10, which is what the test is for.
 MIN_LEG_VOLUME = int(os.environ.get("MIN_LEG_VOLUME", "100"))
+MIN_LONG_LEG_VOLUME = int(os.environ.get("MIN_LONG_LEG_VOLUME", "10"))
 WALK_START_FRACTION = float(os.environ.get("WALK_START_FRACTION", "0.70"))
 WALK_STEP_FRACTION = float(os.environ.get("WALK_STEP_FRACTION", "0.05"))
 WALK_START_FLOOR = float(os.environ.get("WALK_START_FLOOR", "0.05"))
@@ -334,9 +344,13 @@ def find_best_pair(ticker, price, expirations):
     strike actually listed in both chains. The long leg is the next
     expiry after the short leg.
 
-    Liquidity gate: a candidate is rejected when any of its four legs
-    traded fewer than MIN_LEG_VOLUME contracts today (default 100) —
-    the skip line then reports "low-volume" instead of a price.
+    Liquidity gate, two-tier: the SHORT legs (front expiry) must have
+    traded at least MIN_LEG_VOLUME contracts today (default 100), and
+    the LONG legs (next expiry) at least MIN_LONG_LEG_VOLUME (default
+    10). Volume concentrates in the front expiry — AAPL's Nov 18 legs
+    traded 15 and 74 while the Nov 16 legs traded 200 and 2,791 — so
+    one floor on all four legs would block liquid names outright. The
+    skip line reports "low-volume" when a candidate fails the gate.
 
     Never raises: a ticker with no expiry in the 5-7 DTE window (the
     normal state for Friday-only names on Tue-Thu, and for AZN almost
@@ -393,15 +407,18 @@ def find_best_pair(ticker, price, expirations):
                 - short_chain[(put_strike, "put")][1]
                 - short_chain[(call_strike, "call")][1]
             )
-            vols = (
+            short_vols = (
                 short_chain[(put_strike, "put")][2],
                 short_chain[(call_strike, "call")][2],
+            )
+            long_vols = (
                 long_chain[(put_strike, "put")][2],
                 long_chain[(call_strike, "call")][2],
             )
         except KeyError:
             continue
-        if min(vols) < MIN_LEG_VOLUME:
+        if (min(short_vols) < MIN_LEG_VOLUME
+                or min(long_vols) < MIN_LONG_LEG_VOLUME):
             saw_low_volume = True
             continue
         candidate = (short_exp, long_exp, put_strike, call_strike,

@@ -213,11 +213,13 @@ process type. Paper-only by construction: the host is hardcoded to
   cycle. A bid left working when its pair stops qualifying is
   cancelled as stale. A fill shows up as a position next poll, and the
   per-poll check then places the GTC take-profit.
-- Liquidity gate: a candidate pair is rejected when any of its four
-  legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
-  and the skip line reports "low-volume". Deep OTM legs show volume 0
-  in the sandbox; the floor keeps the worker out of names nobody is
-  trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
+- Liquidity gate, two-tier: the SHORT legs (front expiry) must have
+  traded at least MIN_LEG_VOLUME contracts today (default 100), and
+  the LONG legs (next expiry) at least MIN_LONG_LEG_VOLUME (default
+  10). Volume concentrates in the front expiry — AAPL's Nov 18 legs
+  traded 15 and 74 while the Nov 16 legs traded 200 and 2,791 — so one
+  floor on all four legs would block liquid names outright. The skip
+  line reports "low-volume" when a candidate fails the gate.
 - 1 contract per trade (CONTRACTS), per ticker.
 - Exit at a 10% gain on the debit basis. As soon as an entry fills, it
   places a GTC credit order to close the position at 110% of the debit
