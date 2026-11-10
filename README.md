@@ -22,9 +22,15 @@ reach a live account.
   Pairs over $11.00 are logged with their actual price and retried
   next poll.
 - Max 5 contracts per trade (see CONTRACTS), one position at a time.
-- Exit at a 10% gain on the debit basis. There is no end-of-day forced
-  close: a position that never reaches 10% stays open and blocks new
-  entries until it does.
+- Exit at a 10% gain on the debit basis. As soon as an entry fills, it
+  places a GTC credit order to close the position at 110% of the debit
+  paid (e.g. $16.06/share on a $14.60 entry), so the exit triggers the
+  moment the market touches it — even between polls or overnight. The
+  poll-based 10% exit is the fallback if no take-profit order is
+  working. The standing order caps the gain at exactly 10%: it will
+  not capture an overshoot above the line. There is no end-of-day
+  forced close: a position that never reaches 10% stays open and
+  blocks new entries until it does.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement is logged immediately.
 
