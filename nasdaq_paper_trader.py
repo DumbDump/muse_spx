@@ -35,6 +35,17 @@ Nasdaq-100 names by market cap, on the paper account only:
   position. An unfilled cycle cancels and waits 5 minutes before the
   next cycle for that ticker. Pairs over the ceiling are logged with
   their actual price and retried next poll.
+- Execute at the bid: the walk-up never bids above the spread's bid
+  (long-leg bids minus short-leg asks, read off the same chains) or the
+  ceiling, whichever is lower — we are the bidder, never crossing to the
+  ask. If the 70% start is already above the bid, the first order goes
+  in at the bid. A fill at the bid may take longer than paying the mid;
+  that is the point.
+- Liquidity gate: a candidate pair is rejected when any of its four
+  legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
+  and the skip line reports "low-volume". Deep OTM legs show volume 0
+  in the sandbox; the floor keeps the worker out of names nobody is
+  trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
 - Ceiling is a fraction of the underlying price (MAX_DEBIT_FRACTION,
   default 0.0025 = 0.25%): about $0.47/share for NVDA at $187 and
   $3.54 for ASML at $1,418. A flat dollar ceiling would systematically
@@ -128,6 +139,13 @@ TICKERS = [t.strip().upper() for t in os.environ.get(
 CONTRACTS = max(1, min(10, int(os.environ.get("CONTRACTS", "1"))))
 STRIKE_WIDTH_PCT = float(os.environ.get("STRIKE_WIDTH_PCT", "0.02"))
 MAX_DEBIT_FRACTION = float(os.environ.get("MAX_DEBIT_FRACTION", "0.0025"))
+# Liquidity gate: every leg of a candidate pair must have traded at
+# least this many contracts today (Tradier chain "volume"). Deep OTM
+# legs show volume 0 in the sandbox; a 100-contract floor keeps the
+# worker out of names nobody is trading while passing liquid names
+# (AAPL Nov 16 ATM legs run 100-2,700). Env-tunable: raise it to
+# tighten, lower it to let thinner names in.
+MIN_LEG_VOLUME = int(os.environ.get("MIN_LEG_VOLUME", "100"))
 WALK_START_FRACTION = float(os.environ.get("WALK_START_FRACTION", "0.70"))
 WALK_STEP_FRACTION = float(os.environ.get("WALK_STEP_FRACTION", "0.05"))
 WALK_START_FLOOR = float(os.environ.get("WALK_START_FLOOR", "0.05"))
@@ -257,10 +275,12 @@ def get_expirations(ticker):
     return out
 
 
-def get_chain_mids(ticker, expiry):
-    """Return {(strike, kind): mid} for one expiry, or {} when the endpoint
-    returns no usable chain data (JSON null). Callers treat {} as 'this
-    expiry skipped', never as a crash."""
+def get_chain(ticker, expiry):
+    """Return {(strike, kind): (bid, ask, volume)} for one expiry, or {}
+    when the endpoint returns no usable chain data (JSON null). Legs
+    with no usable bid/ask (or a non-positive mid) are dropped — a
+    spread cannot be priced off them. Callers treat {} as 'this expiry
+    skipped', never as a crash."""
     data = api_get(
         "/v1/markets/options/chains?symbol=%s&expiration=%s&greeks=false"
         % (ticker, expiry.isoformat())
@@ -273,15 +293,25 @@ def get_chain_mids(ticker, expiry):
         return {}
     if isinstance(options, dict):
         options = [options]
-    mids = {}
+    chain = {}
     for opt in options:
         try:
-            mids[(float(opt["strike"]), opt["option_type"])] = (
-                float(opt["bid"]) + float(opt["ask"])
-            ) / 2.0
+            bid = float(opt["bid"])
+            ask = float(opt["ask"])
+            if (bid + ask) / 2.0 <= 0:
+                continue
+            chain[(float(opt["strike"]), opt["option_type"])] = (
+                bid, ask, int(opt.get("volume") or 0))
         except (KeyError, TypeError, ValueError):
             continue
-    return mids
+    return chain
+
+
+def get_chain_mids(ticker, expiry):
+    """Return {(strike, kind): mid} for one expiry, derived from
+    get_chain. Kept as the test seam; find_best_pair uses get_chain
+    directly so it also sees bid/ask (for bid execution) and volume."""
+    return {k: (b + a) / 2.0 for k, (b, a, _v) in get_chain(ticker, expiry).items()}
 
 
 def _nearest_strike(target, available):
@@ -297,12 +327,22 @@ def find_best_pair(ticker, price, expirations):
     debit (or None), plus the ceiling itself, plus a skip reason (or
     None when a pair was evaluated).
 
+    Each candidate is (short_exp, long_exp, put_strike, call_strike,
+    debit, bid): debit is the mid-based modeled cost, bid is the
+    spread's bid — what the position could be sold for right now
+    (long-leg bids minus short-leg asks). The walk-up caps at the bid,
+    so entries execute at the bid and never cross to the ask.
+
     The ceiling is MAX_DEBIT_FRACTION of the underlying price, so it
     scales from about $0.47 for NVDA to about $3.54 for ASML. Targets
     are price +/- STRIKE_WIDTH_PCT, snapped to the nearest strike
     actually listed in both chains. The long leg is the next expiry
     after the short leg. The cheapest pair is what the skip line prints,
     so the log shows the actual price even on a skipped day.
+
+    Liquidity gate: a candidate is rejected when any of its four legs
+    traded fewer than MIN_LEG_VOLUME contracts today (default 100) —
+    the skip line then reports "low-volume" instead of a price.
 
     Never raises: a ticker with no expiry in the 5-7 DTE window (the
     normal state for Friday-only names on Tue-Thu, and for AZN almost
@@ -318,6 +358,7 @@ def find_best_pair(ticker, price, expirations):
     cheapest = None
     saw_window = False
     saw_chains = False
+    saw_low_volume = False
     for i, short_exp in enumerate(expirations):
         dte = (short_exp - today).days
         if dte < SHORT_DTE_MIN or dte > SHORT_DTE_MAX:
@@ -326,10 +367,12 @@ def find_best_pair(ticker, price, expirations):
         if i + 1 >= len(expirations):
             continue
         long_exp = expirations[i + 1]
-        short_mids = get_chain_mids(ticker, short_exp)
-        long_mids = get_chain_mids(ticker, long_exp)
-        if short_mids or long_mids:
+        short_chain = get_chain(ticker, short_exp)
+        long_chain = get_chain(ticker, long_exp)
+        if short_chain or long_chain:
             saw_chains = True
+        short_mids = {k: (b + a) / 2.0 for k, (b, a, _v) in short_chain.items()}
+        long_mids = {k: (b + a) / 2.0 for k, (b, a, _v) in long_chain.items()}
         # Strikes listed in both chains, per kind; snap each target to
         # the closest listed strike (grids differ by name and price).
         put_strikes = sorted(
@@ -349,9 +392,28 @@ def find_best_pair(ticker, price, expirations):
                 - short_mids[(put_strike, "put")]
                 - short_mids[(call_strike, "call")]
             )
+            # Spread bid: what we could sell this calendar for now
+            # (long-leg bids minus short-leg asks). Always at or below
+            # the mid-based debit.
+            bid = (
+                long_chain[(put_strike, "put")][0]
+                + long_chain[(call_strike, "call")][0]
+                - short_chain[(put_strike, "put")][1]
+                - short_chain[(call_strike, "call")][1]
+            )
+            vols = (
+                short_chain[(put_strike, "put")][2],
+                short_chain[(call_strike, "call")][2],
+                long_chain[(put_strike, "put")][2],
+                long_chain[(call_strike, "call")][2],
+            )
         except KeyError:
             continue
-        candidate = (short_exp, long_exp, put_strike, call_strike, round(debit, 2))
+        if min(vols) < MIN_LEG_VOLUME:
+            saw_low_volume = True
+            continue
+        candidate = (short_exp, long_exp, put_strike, call_strike,
+                     round(debit, 2), round(bid, 2))
         if cheapest is None or candidate[4] < cheapest[4]:
             cheapest = candidate
         if debit <= ceiling and (best is None or debit < best[4]):
@@ -364,6 +426,8 @@ def find_best_pair(ticker, price, expirations):
         # other nineteen.
         log("%s: no option chains data from Tradier, skipping this poll" % ticker)
         return None, None, ceiling, "no-chain-data"
+    if best is None and cheapest is None and saw_low_volume:
+        return None, None, ceiling, "low-volume"
     return best, cheapest, ceiling, None
 
 
@@ -596,31 +660,37 @@ def cancel_order(account, order_id):
 
 
 def run_walkup_cycle(account, ticker, short_exp, long_exp, put, call,
-                     modeled_debit, ceiling):
-    """Bid a pair from 70% of the modeled debit up to the ceiling.
+                     modeled_debit, ceiling, bid):
+    """Bid a pair from 70% of the modeled debit up to the spread's bid.
 
     Places a debit limit order, waits 30 seconds, and if it is still
     working, cancels it and re-places one step higher (5% of the modeled
-    debit per step, floors $0.05 start / $0.01 step). Returns True when
-    the order filled (or partially filled, leaving a position), False
-    when the walk reached the ceiling unfilled or was blocked. A cycle
-    started inside the entry window is allowed to finish even if the
-    window ends mid-cycle. Only the worker's own tagged order is ever
-    cancelled, and only after the one-pending check passes."""
+    debit per step, floors $0.05 start / $0.01 step). The walk never
+    goes above the spread's bid (or the ceiling, whichever is lower):
+    entries execute at the bid — we are the bidder, never crossing to
+    the ask. If the start is already above the bid, the first order
+    goes in at the bid. Returns True when the order filled (or
+    partially filled, leaving a position), False when the walk reached
+    the cap unfilled or was blocked. A cycle started inside the entry
+    window is allowed to finish even if the window ends mid-cycle.
+    Only the worker's own tagged order is ever cancelled, and only
+    after the one-pending check passes."""
     legs = [
         ("sell_to_open", option_symbol(ticker, short_exp, put, "P"), CONTRACTS),
         ("sell_to_open", option_symbol(ticker, short_exp, call, "C"), CONTRACTS),
         ("buy_to_open", option_symbol(ticker, long_exp, put, "P"), CONTRACTS),
         ("buy_to_open", option_symbol(ticker, long_exp, call, "C"), CONTRACTS),
     ]
-    start = max(WALK_START_FLOOR, round(modeled_debit * WALK_START_FRACTION, 2))
+    cap = min(ceiling, bid)
+    start = min(max(WALK_START_FLOOR, round(modeled_debit * WALK_START_FRACTION, 2)),
+                cap)
     step = max(WALK_STEP_FLOOR, round(modeled_debit * WALK_STEP_FRACTION, 2))
     log("walk-up: %s cycle starting short %s / long %s %dP/%dC from %.2f "
-        "step %.2f ceiling %.2f (modeled %.2f)"
-        % (ticker, short_exp, long_exp, put, call, start, step, ceiling,
+        "step %.2f bid cap %.2f (ceiling %.2f, modeled %.2f)"
+        % (ticker, short_exp, long_exp, put, call, start, step, cap, ceiling,
            modeled_debit))
     price = start
-    while price <= ceiling + 1e-9:
+    while price <= cap + 1e-9:
         price = round(price, 2)
         resp = place_order(account, ticker, "debit", price, legs)
         if resp.get("blocked"):
@@ -669,7 +739,7 @@ def run_walkup_cycle(account, ticker, short_exp, long_exp, put, call,
             log("walk-up: %s order %s ended as %s at %.2f"
                 % (ticker, order_id, status, price))
         price = round(price + step, 2)
-    log("walk-up: %s reached %.2f unfilled, cycle done" % (ticker, ceiling))
+    log("walk-up: %s reached %.2f unfilled, cycle done" % (ticker, cap))
     return False
 
 
@@ -797,19 +867,21 @@ def run_once():
                     pair, cheapest, ceiling, reason = find_best_pair(
                         ticker, price, get_expirations(ticker))
                     if pair is None:
-                        if cheapest is not None:
+                        if reason == "low-volume":
+                            skips.append("%s low-volume" % ticker)
+                        elif cheapest is not None:
                             skips.append("%s %.2f>%.2f" % (ticker, cheapest[4], ceiling))
                         else:
                             skips.append("%s %s" % (ticker, reason))
                     else:
-                        short_exp, long_exp, put, call, debit = pair
+                        short_exp, long_exp, put, call, debit, bid = pair
                         log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
-                            "ceiling %.2f x %d"
+                            "bid %.2f ceiling %.2f x %d"
                             % (ticker, price, short_exp, long_exp, put, call,
-                               debit, ceiling, CONTRACTS))
+                               debit, bid, ceiling, CONTRACTS))
                         filled = run_walkup_cycle(
                             account, ticker, short_exp, long_exp, put, call,
-                            debit, ceiling)
+                            debit, ceiling, bid)
                         if filled:
                             # Place the take-profit immediately: a GTC
                             # credit order at 110% of the debit actually

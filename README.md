@@ -212,6 +212,17 @@ process type. Paper-only by construction: the host is hardcoded to
   unfilled cycle cancels and waits 5 minutes before the next cycle for
   that ticker. Pairs over the ceiling are logged with their actual
   price and retried next poll.
+- Execute at the bid: the walk-up never bids above the spread's bid
+  (long-leg bids minus short-leg asks, read off the same chains) or the
+  ceiling, whichever is lower — we are the bidder, never crossing to
+  the ask. If the 70% start is already above the bid, the first order
+  goes in at the bid. A fill at the bid may take longer than paying the
+  mid; that is the point.
+- Liquidity gate: a candidate pair is rejected when any of its four
+  legs traded fewer than MIN_LEG_VOLUME contracts today (default 100),
+  and the skip line reports "low-volume". Deep OTM legs show volume 0
+  in the sandbox; the floor keeps the worker out of names nobody is
+  trading while passing liquid ones (AAPL Nov 16 ATM legs run 100-2,700).
 - Ceiling is a fraction of the underlying price (MAX_DEBIT_FRACTION,
   default 0.0025 = 0.25%): about $0.47/share for NVDA at $187 and
   $3.54 for ASML at $1,418. A flat dollar ceiling would systematically
