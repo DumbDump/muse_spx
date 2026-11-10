@@ -31,6 +31,10 @@ reach a live account.
   not capture an overshoot above the line. There is no end-of-day
   forced close: a position that never reaches 10% stays open and
   blocks new entries until it does.
+- Loss exit: close at the mid when the position's value falls to 50% of
+  the debit paid (STOP_LOSS_FRACTION, default 0.50). Time exit: close
+  when the short leg has 1 day or less to expiry, so a position that
+  never reaches 10% cannot ride through short-leg expiry.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement is logged immediately.
 
@@ -118,6 +122,10 @@ is hardcoded to `sandbox.tradier.com`.
   not capture an overshoot above the line. There is no end-of-day
   forced close: a position that never reaches 10% stays open and
   blocks new entries until it does.
+- Loss exit: close at the mid when the position's value falls to 50% of
+  the debit paid (STOP_LOSS_FRACTION, default 0.50). Time exit: close
+  when the short leg has 1 day or less to expiry, so a position that
+  never reaches 10% cannot ride through short-leg expiry.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement is logged immediately.
 

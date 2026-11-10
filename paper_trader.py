@@ -30,6 +30,10 @@ Implements one fixed rule set, nothing else:
   above the line the way a poll-time close at the mid could. There is no
   end-of-day forced close: a position that never reaches 10% stays open
   (and blocks new entries) until it does.
+- Loss exit: close at the mid when the position's value falls to 50% of
+  the debit paid (STOP_LOSS_FRACTION, default 0.50). Time exit: close
+  when the short leg has 1 day or less to expiry, so a position that
+  never reaches 10% cannot ride through short-leg expiry.
 - No preview step: when the rules say enter or exit, the order is placed
   directly. Every placement and fill is logged immediately.
 - Every order carries a tag ("muse-spx" by default, overridable with
@@ -66,8 +70,9 @@ Notes:
   are estimates, not live brokerage marks.
 - Entry orders are day orders: an order left unfilled at the close
   expires with the session. The take-profit order is GTC and stays
-  working across sessions. Positions are closed only on the 10% gain
-  exit, so a position may be carried overnight by design.
+  working across sessions. Positions are closed on the 10% gain exit,
+  the 50% stop-loss, or the day before short-leg expiry, so a position
+  may be carried overnight by design.
 
 Usage:
 
@@ -77,6 +82,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -98,6 +104,7 @@ ENTRY_START = dtime(6, 45)
 ENTRY_END = dtime(12, 30)
 COOLDOWN_SECONDS = 300
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "180"))
+STOP_LOSS_FRACTION = float(os.environ.get("STOP_LOSS_FRACTION", "0.50"))
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx")
 
 
@@ -306,23 +313,27 @@ def get_pending_orders(account):
     return pending
 
 
-def has_blocking_pending_order(account, legs):
+def has_blocking_pending_order(account, legs, exclude_id=None):
     """True when the worker already has a pending order that would collide
     with the given legs: same tag, or the same leg symbols. Matching on leg
     symbols means the check works even for orders placed before tagging, and
-    even if the provider does not echo the tag back."""
+    even if the provider does not echo the tag back. exclude_id skips one
+    order the caller just cancelled, so a stale feed listing it does not
+    block the replacement close."""
     new_symbols = {symbol for _, symbol, _ in legs}
     for order in get_pending_orders(account):
+        if exclude_id is not None and str(order["id"]) == str(exclude_id):
+            continue
         if order["tag"] == ORDER_TAG or order["symbols"] == new_symbols:
             return True, order["id"]
     return False, None
 
 
-def place_order(account, order_type, price, legs, duration="day"):
+def place_order(account, order_type, price, legs, duration="day", exclude_order_id=None):
     """legs: list of (side, symbol, qty). Returns the API response dict.
     Never creates a second pending order: if a colliding order is already
     pending, the placement is skipped and logged."""
-    blocked, blocking_id = has_blocking_pending_order(account, legs)
+    blocked, blocking_id = has_blocking_pending_order(account, legs, exclude_id=exclude_order_id)
     if blocked:
         log("SKIPPED %s order at %.2f: pending order %s already exists"
             % (order_type, price, blocking_id))
@@ -368,6 +379,24 @@ def position_value_and_basis(account):
     return value, basis, legs
 
 
+def short_expiry_from_legs(legs):
+    """Expiry date of the short leg, parsed from the option symbols.
+
+    The first 6-digit run in a symbol is the YYMMDD expiry
+    (SPXW261112... and QQQ261116... alike). The short leg is the
+    earliest-expiring leg with a negative quantity. Returns None when
+    no expiry parses."""
+    expiries = []
+    for leg in legs:
+        if float(leg["quantity"]) >= 0:
+            continue
+        match = re.search(r"(\d{6})", leg["symbol"])
+        if match:
+            code = match.group(1)
+            expiries.append(date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6])))
+    return min(expiries) if expiries else None
+
+
 def close_legs_for(legs):
     """Closing legs for open legs: buy back shorts, sell longs."""
     out = []
@@ -405,14 +434,36 @@ def place_take_profit(account, legs, basis):
 
 
 def close_position(account, legs):
-    """Build and place the closing order for the given open legs."""
-    value, basis, _ = position_value_and_basis(account)
+    """Build and place the closing order for the given open legs.
+
+    Cancels the working take-profit order first: the one-pending rule
+    would otherwise block the close, since the take-profit carries the
+    same leg symbols. If the cancel fails, the close is skipped and the
+    next poll retries. Returns early when the position is already gone
+    (e.g. the take-profit filled just before this poll)."""
+    value, basis, fresh_legs = position_value_and_basis(account)
+    if not fresh_legs:
+        log("closing: position already closed, nothing to do")
+        return {"already_closed": True}
+    legs = fresh_legs
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     credit = round(value / (contracts * 100.0), 2)
     close_legs = close_legs_for(legs)
+    blocked, blocking_id = has_blocking_pending_order(account, close_legs)
+    if blocked:
+        try:
+            cancel_order(account, blocking_id)
+            log("closing: cancelled working order %s to place the close" % blocking_id)
+        except Exception as exc:  # noqa: BLE001 - retry next poll
+            log("closing: cancel of order %s failed (%s), close skipped, will retry"
+                % (blocking_id, exc))
+            return {"blocked": True, "blocking_order_id": blocking_id}
     log("closing: value=%.2f basis=%.2f unrealized=%.2f credit=%.2f"
         % (value, basis, value - basis, credit))
-    return place_order(account, "credit", credit, close_legs)
+    # exclude_order_id: the cancel above just removed this order, but a
+    # stale feed may still list it — do not let it block its own close.
+    return place_order(account, "credit", credit, close_legs,
+                       exclude_order_id=blocking_id if blocked else None)
 
 
 def get_order_status(account, order_id):
@@ -563,13 +614,25 @@ def run_once():
                 flat_state = "waiting for window"
             log(heartbeat_line(now, legs, value, basis, spx_txt, flat_state))
             if legs:
-                # Keep a standing take-profit in place: a GTC credit order
-                # at 110% of basis. This covers restarts and positions
-                # entered before this code shipped; it is silent when an
-                # order is already working.
-                if basis > 0:
-                    place_take_profit(account, legs, basis)
                 unrealized = value - basis
+                # Loss exit: close at the mid when the position has lost
+                # half the debit (value at or under STOP_LOSS_FRACTION of
+                # basis). Poll-based — the GTC slot is held by the
+                # take-profit — so a gap between polls can overshoot it.
+                if basis > 0 and value <= STOP_LOSS_FRACTION * basis:
+                    log("stop-loss hit: value %.2f on basis %.2f" % (value, basis))
+                    close_position(account, legs)
+                    time.sleep(POLL_SECONDS)
+                    continue
+                # Time exit: close when the short leg has 1 day or less
+                # to expiry, so the position never rides through
+                # short-leg expiry and morphs into a naked long straddle.
+                short_exp = short_expiry_from_legs(legs)
+                if short_exp is not None and (short_exp - today).days <= 1:
+                    log("short-leg expiry close: short leg expires %s" % short_exp)
+                    close_position(account, legs)
+                    time.sleep(POLL_SECONDS)
+                    continue
                 # 10% gain exit, any time of day. This is the fallback
                 # for when no take-profit order is working: there is no
                 # end-of-day forced close, so a position that never
@@ -579,6 +642,13 @@ def run_once():
                     close_position(account, legs)
                     time.sleep(POLL_SECONDS)
                     continue
+                # Keep a standing take-profit in place: a GTC credit order
+                # at 110% of basis. This covers restarts and positions
+                # entered before this code shipped; it is silent when an
+                # order is already working. Checked after the closes above
+                # so this poll never places a GTC it is about to cancel.
+                if basis > 0:
+                    place_take_profit(account, legs, basis)
             else:
                 # Walk-up entry, no day skip: while flat and in the
                 # window, evaluate every poll; an unfilled cycle cools
