@@ -494,11 +494,15 @@ def adopt_working_bid_orders(account, bid_orders):
     in-memory and resets on redeploy, but a day bid order placed
     before the restart is still working in Tradier; without this the
     worker would be blocked from bidding (one-pending rule) until that
-    order fills or expires at the close. Only debit orders carrying
-    this worker's per-ticker tag are adopted — the take-profit GTC is
-    a credit order, so it is never mistaken for a bid. A holding
-    ticker's orders are never adopted for entry anyway (the entry loop
-    skips holding tickers). Returns the tickers adopted."""
+    order fills or expires at the close. Only debit orders whose legs
+    all belong to the ticker are adopted — the take-profit GTC is a
+    credit order, so it is never mistaken for a bid. (Matching is by
+    leg symbols, not by tag: Tradier's orders feed does not echo the
+    tag back — verified Nov 10, order 41588979 carries no tag field —
+    which is why the first version of this function, matching on tag,
+    adopted nothing.) A holding ticker's orders are never adopted for
+    entry anyway (the entry loop skips holding tickers). Returns the
+    tickers adopted."""
     adopted = []
     try:
         pending = get_pending_orders(account)
@@ -508,14 +512,18 @@ def adopt_working_bid_orders(account, bid_orders):
     for order in pending:
         if order.get("type") not in ("debit", None):
             continue
-        for ticker in TICKERS:
-            if ticker in bid_orders:
-                continue
-            if order.get("tag") == tag_for(ticker):
-                bid_orders[ticker] = order["id"]
-                adopted.append(ticker)
-                log("adopted working bid order %s for %s" % (order["id"], ticker))
-                break
+        symbols = order.get("symbols") or set()
+        if not symbols:
+            continue
+        roots = {root_of(s) for s in symbols}
+        if len(roots) != 1:
+            continue
+        ticker = roots.pop()
+        if ticker not in TICKERS or ticker in bid_orders:
+            continue
+        bid_orders[ticker] = order["id"]
+        adopted.append(ticker)
+        log("adopted working bid order %s for %s" % (order["id"], ticker))
     return adopted
 
 
