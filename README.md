@@ -340,3 +340,10 @@ strike is held, the entry is skipped rather than doubling up on a
 leg. Example: it wants 7580/7575 but 7580 is already open, so it
 trades 7575/7570 instead. The credit and volume checks still apply
 to the shifted legs.
+
+## Trend worker minimum credit (Nov 11)
+
+The trend worker's minimum credit is now $1.00 per share (was
+$0.15). The credit window is [$1.00, $2.50]. A spread whose
+mid-based credit is below $1.00 is skipped. This is the code
+default (`MIN_CREDIT`, overridable by the env var of the same name).
