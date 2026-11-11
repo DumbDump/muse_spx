@@ -370,9 +370,32 @@ def place_order(account, order_type, price, legs, duration="day", exclude_order_
     return resp
 
 
+def _expiry_from_symbol(symbol):
+    """Expiry date parsed from an option symbol (the first 6-digit
+    YYMMDD run). Returns None when no expiry parses."""
+    match = re.search(r"(\d{6})", symbol)
+    if not match:
+        return None
+    code = match.group(1)
+    return date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6]))
+
+
 def position_value_and_basis(account):
-    """Return (net_value, net_basis, legs) for open SPXW legs."""
-    legs = [p for p in get_positions(account) if p["symbol"].startswith("SPXW")]
+    """Return (net_value, net_basis, legs) for open SPXW legs.
+    Only this worker's own double-calendar legs are returned: legs
+    expiring after today. A 0DTE vertical (the trend worker's spread)
+    expires today and is ignored, so this worker never closes another
+    lane's position. (Nov 11: the trend worker's first spread was
+    closed 68 seconds after its fill by this worker's time exit, which
+    fires on any short leg expiring within 1 day — a 0DTE spread
+    qualifies. This filter stops that cross-worker interference.) The
+    worker closes its own calendar at short-leg DTE <= 1, so its legs
+    never expire today in normal operation."""
+    today = datetime.now(TZ).date()
+    legs = [p for p in get_positions(account)
+            if p["symbol"].startswith("SPXW")
+            and _expiry_from_symbol(p["symbol"]) is not None
+            and _expiry_from_symbol(p["symbol"]) > today]
     if not legs:
         return 0.0, 0.0, []
     symbols = ",".join(p["symbol"] for p in legs)
@@ -532,6 +555,13 @@ def cleanup_stale_take_profit_orders(account):
             continue
         symbols = order.get("symbols") or set()
         if not symbols or not all(s.startswith("SPXW") for s in symbols):
+            continue
+        # Only this worker's own take-profit GTCs: their legs expire
+        # after today. A 0DTE vertical (the trend worker's entry) has
+        # legs expiring today and must never be cancelled here.
+        today = datetime.now(TZ).date()
+        if not all(_expiry_from_symbol(s) is not None
+                   and _expiry_from_symbol(s) > today for s in symbols):
             continue
         order_id = str(order["id"])
         if order_id in _STALE_TAKE_PROFIT_CANCEL_TRIED:

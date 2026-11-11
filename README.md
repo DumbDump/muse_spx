@@ -305,3 +305,26 @@ closed 5 minutes before the market close.
   170eda59), so a stale working entry cannot block a close.
 - Deploy dry-run first (`ENABLE_TRADING` unset/0); flip to `1` only on
   the user's instruction.
+
+## Cross-worker position isolation (Nov 11 fix)
+
+All four workers trade the same paper account, and Tradier positions
+carry no tag — so a worker that reads "all SPXW positions" sees the
+other lanes' spreads too. On Nov 11 the SPX worker's time exit (close
+when a short leg expires within 1 day) fired on the trend worker's
+first 0DTE spread and closed it 68 seconds after its fill, at a $0.10
+loss, because a 0DTE short leg expires "within 1 day". The trend
+worker then re-entered and the same thing was about to happen again.
+
+Fix (commit, Nov 11): each worker only manages its own legs.
+- SPX worker (`paper_trader.py`): `position_value_and_basis` returns
+  only legs expiring after today (its double calendar: short 3-5 DTE,
+  long next expiry). A 0DTE vertical expires today and is invisible
+  to it. Its stale-take-profit cleanup likewise only cancels credit
+  orders whose legs all expire after today, so it never cancels the
+  trend worker's working entry.
+- Trend worker (`spx_trend_paper_trader.py`): `position_value_and_basis`
+  returns only legs expiring today (its 0DTE vertical). A multi-day
+  calendar is invisible to it.
+- QQQ (QQQ root) and Nasdaq (single names) never shared a symbol
+  prefix with SPXW, so they needed no change.

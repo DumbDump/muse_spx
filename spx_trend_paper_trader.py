@@ -462,14 +462,30 @@ def close_legs_for(legs):
     return out
 
 
+def _expiry_from_symbol(symbol):
+    """Expiry date parsed from an option symbol (the first 6-digit
+    YYMMDD run). Returns None when no expiry parses."""
+    match = re.search(r"(\d{6})", symbol)
+    if not match:
+        return None
+    code = match.group(1)
+    return date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6]))
+
+
 def position_value_and_basis(account):
     """Return (buyback, credit, legs) for the open SPX trend spread.
-    The worker shorts the spread, so the position's market value is
-    negative (what it would cost to buy back) and its cost basis is
-    negative (the credit received). buyback = -value, credit = -basis,
-    P&L = credit - buyback. Returns (0.0, 0.0, []) when flat."""
+    Only this worker's own 0DTE vertical is returned: legs expiring
+    today. A multi-day double calendar (the SPX worker's position)
+    has legs expiring after today and is ignored, so this worker never
+    manages another lane's position. The worker shorts the spread, so
+    the position's market value is negative (what it would cost to buy
+    back) and its cost basis is negative (the credit received).
+    buyback = -value, credit = -basis, P&L = credit - buyback.
+    Returns (0.0, 0.0, []) when flat."""
+    today = datetime.now(TZ).date()
     legs = [p for p in get_positions(account)
-            if str(p.get("symbol", "")).startswith("SPXW")]
+            if str(p.get("symbol", "")).startswith("SPXW")
+            and _expiry_from_symbol(str(p.get("symbol", ""))) == today]
     if not legs:
         return 0.0, 0.0, []
     symbols = ",".join(p["symbol"] for p in legs)
