@@ -272,3 +272,36 @@ process type. Paper-only by construction: the host is hardcoded to
    worker's `muse-qqq` orders. All three workers trade the same paper
    account: each enforces one position at a time for itself (per ticker
    for this worker), but they can each hold positions at the same time.
+
+## SPX trend vertical spreads (`spx_trend_paper_trader.py`, service `spx-trend-worker`)
+
+A fourth lane, added Nov 11 at the user's request: SPX 0DTE vertical
+credit spreads whose direction follows the trend, with every position
+closed 5 minutes before the market close.
+
+- Trend: 9/21 EMA crossover on 15-minute SPX bars, seeded from the prior
+  sessions' bars so the read is valid from the open. (VWAP is NOT used:
+  SPX is an index and Tradier's timesales returns volume 0 for it, so a
+  volume-weighted average cannot be computed from this feed.)
+- Bullish (EMA 9 above EMA 21) -> bull put spread; bearish -> bear call
+  spread. No trade when the EMAs are equal or there are too few bars.
+- Spreads are $5 wide, 1 contract, short leg ~0.5% out of the money
+  (snapped to the nearest listed $5 strike), long leg $5 further out.
+  Both legs need a two-sided quote and at least 10 contracts traded;
+  the mid-based credit must sit in [$0.15, $2.50].
+- Entry window 7:00 a.m.-12:00 p.m. PT (10:00 a.m.-3:00 p.m. ET),
+  weekdays. One position at a time. One limit credit order at the
+  spread's mid; it stays working while the trend still matches and is
+  cancelled if the trend flips, the strikes move, or the window ends.
+  A trend flip while holding does NOT close and reverse.
+- Exits (poll-based, every 60 s): take profit when the buy-back cost
+  falls to 50% of the credit received; stop when it reaches 2x the
+  credit. No standing GTC take-profit.
+- HARD EXIT at 12:55 p.m. PT (3:55 p.m. ET): any open position is
+  closed at the mid, whatever its P&L. The check runs every poll, so a
+  failed close is retried. No position is ever carried overnight.
+- Polls every 60 s. Orders are tagged `muse-spx-trend`. A credit order
+  never blocks a debit placement (the stale-GTC fix from commit
+  170eda59), so a stale working entry cannot block a close.
+- Deploy dry-run first (`ENABLE_TRADING` unset/0); flip to `1` only on
+  the user's instruction.
