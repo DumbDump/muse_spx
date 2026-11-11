@@ -33,9 +33,14 @@ Implements one fixed rule set, nothing else:
   trend still matches, and is cancelled if the trend flips or the
   window ends. A trend flip while holding does NOT close and reverse:
   the open position is held until an exit fires.
-- Exits (poll-based, every 60 seconds): take profit when the buy-back
+- Exits: a standing GTC take-profit is placed when a position opens
+  (buy back at 50% of the credit received), and the poll-based exits
+  remain as a fallback every 60 seconds: take profit when the buy-back
   cost falls to 50% of the credit received; stop when the buy-back cost
-  reaches 2x the credit received. No standing GTC take-profit.
+  reaches 2x the credit received. Any close (profit, stop, or hard
+  exit) cancels the working GTC first, and a new GTC is placed when
+  the next position opens — so a close at the max-loss stop always
+  clears the old GTC and the next entry gets a fresh one.
 - HARD EXIT: every position is closed at 12:55 p.m. PT (3:55 p.m. ET),
   5 minutes before the 4:00 p.m. ET market close, whatever its P&L.
   The check runs every poll, so a failed close is retried until it
@@ -46,8 +51,13 @@ Implements one fixed rule set, nothing else:
   open orders and skips if a colliding order is already pending. A
   credit order never blocks a debit placement (a credit order is a
   take-profit or an entry for a position that may be gone — Tradier may
-  refuse to cancel it, so a debit close must not wait on it); credit
-  placements keep the old rule, so no duplicate entry is ever placed.
+  refuse to cancel it, so a debit close must not wait on it); a debit
+  order never blocks a credit placement (a debit order is the GTC
+  take-profit or a close for a position that may be gone, so a new
+  entry must not wait on it). Credit placements keep the old rule, so
+  no duplicate entry is ever placed, and a duplicate GTC is never
+  placed either — the worker adopts a working GTC by its leg symbols
+  on startup, since Tradier does not echo the tag back.
 
 Safety:
 
@@ -510,7 +520,7 @@ def get_pending_orders(account):
     return pending
 
 
-def has_blocking_pending_order(account, legs, exclude_id=None, ignore_credit=False):
+def has_blocking_pending_order(account, legs, exclude_id=None, ignore_credit=False, ignore_debit=False):
     """True when the worker already has a pending order that would
     collide with the given legs: same tag, or the same leg symbols.
     Matching on leg symbols means the check works even for orders
@@ -519,13 +529,18 @@ def has_blocking_pending_order(account, legs, exclude_id=None, ignore_credit=Fal
     a stale feed listing it does not block the replacement. ignore_credit
     is True only for debit placements: a credit order is a take-profit
     or an entry for a position that may be gone, and Tradier may refuse
-    to cancel it, so a debit close must not wait on it. Credit
-    placements keep the old rule, so no duplicate entry is ever placed."""
+    to cancel it, so a debit close must not wait on it. ignore_debit
+    is True only for credit placements: a debit order is the GTC
+    take-profit or a close for a position that may be gone, so a new
+    entry must not wait on it. Credit placements keep the old rule, so
+    no duplicate entry is ever placed."""
     new_symbols = {symbol for _, symbol, _ in legs}
     for order in get_pending_orders(account):
         if exclude_id is not None and str(order["id"]) == str(exclude_id):
             continue
         if ignore_credit and order.get("type") == "credit":
+            continue
+        if ignore_debit and order.get("type") == "debit":
             continue
         if order["tag"] == ORDER_TAG or order["symbols"] == new_symbols:
             return True, order["id"]
@@ -538,7 +553,8 @@ def place_order(account, order_type, price, legs, duration="day", exclude_order_
     pending, the placement is skipped and logged."""
     blocked, blocking_id = has_blocking_pending_order(
         account, legs, exclude_id=exclude_order_id,
-        ignore_credit=(order_type == "debit"))
+        ignore_credit=(order_type == "debit"),
+        ignore_debit=(order_type == "credit"))
     if blocked:
         log("SKIPPED %s order at %.2f: pending order %s already exists"
             % (order_type, price, blocking_id))
@@ -627,13 +643,54 @@ def position_value_and_basis(account):
     return -value, -basis, legs
 
 
+def find_gtc_for_legs(account, close_legs):
+    """Return the id of a working debit (GTC take-profit) order whose
+    leg symbols match these close legs, or None. Matching is by leg
+    symbols, not by tag, because Tradier's orders feed does not echo
+    the tag back. Used to adopt a GTC placed before a restart, so no
+    duplicate GTC is ever placed."""
+    target = {symbol for _, symbol, _ in close_legs}
+    for order in get_pending_orders(account):
+        if order.get("type") != "debit":
+            continue
+        if order["symbols"] == target:
+            return order["id"]
+    return None
+
+
+def place_gtc_take_profit(account, legs, credit):
+    """Place the standing GTC take-profit for an open spread: a debit
+    order to buy it back at 50% of the credit received. Returns the
+    order id, or None when skipped (a GTC is already working for
+    these legs, or the placement is blocked)."""
+    contracts = max(abs(int(leg["quantity"])) for leg in legs)
+    if credit <= 0 or contracts <= 0:
+        return None
+    price = round(PROFIT_TARGET_FRACTION * credit / (contracts * 100.0), 2)
+    price = max(price, 0.01)
+    close_legs = close_legs_for(legs)
+    existing = find_gtc_for_legs(account, close_legs)
+    if existing is not None:
+        log("GTC take-profit already working (order %s), not duplicating"
+            % existing)
+        return existing
+    resp = place_order(account, "debit", price, close_legs, duration="gtc")
+    if resp.get("blocked") or resp.get("dry_run"):
+        return None
+    order = resp.get("order", resp)
+    log("GTC take-profit placed id=%s buyback %.2f (50%% of credit %.2f)"
+        % (order.get("id"), price, credit))
+    return order.get("id")
+
+
 def close_position(account, legs, reason):
     """Buy back the open spread at the mid. Cancels a blocking order
-    first (an unfilled entry for the same strikes). The close is a
-    DEBIT order for the buy-back cost — the worker is short the spread,
-    so closing costs money; a negative or zero buy-back is floored at
-    $0.01, since Tradier rejects a zero/negative price. Returns early
-    when the position is already gone."""
+    first — the working GTC take-profit, or an unfilled entry for the
+    same strikes — so the close is the only order working on these
+    legs. The close is a DEBIT order for the buy-back cost — the worker
+    is short the spread, so closing costs money; a negative or zero
+    buy-back is floored at $0.01, since Tradier rejects a zero/negative
+    price. Returns early when the position is already gone."""
     buyback, credit, fresh_legs = position_value_and_basis(account)
     if not fresh_legs:
         log("closing (%s): position already closed, nothing to do" % reason)
@@ -691,6 +748,12 @@ def run_once():
     # working while the trend still matches; it is cancelled when the
     # trend flips, the strikes move, or the entry window ends.
     working_entry = None
+    # Working GTC take-profit: one debit GTC at 50% of the credit, placed
+    # when a position opens. Cancelled on any close; a new one is placed
+    # when the next position opens.
+    working_gtc = None
+    # Stale-GTC cleanup runs once per process run (best effort).
+    gtc_cleanup_done = False
     while True:
         try:
             now = datetime.now(TZ)
@@ -732,28 +795,69 @@ def run_once():
                         log("entry order %s cancel failed (%s), ignoring"
                             % (working_entry["id"], exc))
                     working_entry = None
+                # Standing GTC take-profit: place one (buy back at 50%
+                # of the credit) when a position opens. Adopt the
+                # working one after a restart instead of duplicating it.
+                if working_gtc is None:
+                    working_gtc = place_gtc_take_profit(account, legs, credit)
                 # HARD EXIT: 12:55 p.m. PT, 5 minutes before the close.
                 # Closes whatever is open, at the mid, whatever its P&L.
+                # The close cancels the working GTC first.
                 if now.time() >= HARD_EXIT:
                     log("hard exit 12:55 PT: closing open spread")
                     close_position(account, legs, "hard exit 12:55 PT")
+                    working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
                 # Profit target: buy back at 50% of the credit received.
+                # The GTC normally closes this first; the poll is the
+                # fallback if the GTC has not filled.
                 if credit > 0 and buyback <= PROFIT_TARGET_FRACTION * credit:
                     log("profit target hit: buyback %.2f on credit %.2f"
                         % (buyback, credit))
                     close_position(account, legs, "50% profit target")
+                    working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
                 # Stop: buy-back cost reached 2x the credit received.
+                # The close cancels the working GTC first, so the old
+                # take-profit cannot close a later position; a new GTC
+                # is placed when the next position opens.
                 if credit > 0 and buyback >= STOP_MULTIPLE * credit:
                     log("stop hit: buyback %.2f on credit %.2f"
                         % (buyback, credit))
                     close_position(account, legs, "stop 2x credit")
+                    working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
             else:
+                # Flat: the position is gone, so any tracked GTC either
+                # filled or is stale — clear the tracking. A new GTC is
+                # placed when the next position opens.
+                if working_gtc is not None:
+                    working_gtc = None
+                # Best-effort stale-GTC cleanup once per run: a working
+                # debit order carrying this worker's tag, with no open
+                # position behind it, is a leftover take-profit. Cancel
+                # it once so it cannot close a future position; a refused
+                # cancel is logged once and ignored (it cannot block a
+                # new entry, since credit placements ignore debit orders).
+                if not gtc_cleanup_done:
+                    gtc_cleanup_done = True
+                    try:
+                        for order in get_pending_orders(account):
+                            if (order.get("type") == "debit"
+                                    and order.get("tag") == ORDER_TAG):
+                                try:
+                                    cancel_order(account, order["id"])
+                                    log("stale GTC %s cancelled (flat, no position)"
+                                        % order["id"])
+                                except Exception as exc:  # noqa: BLE001 - best effort
+                                    log("stale GTC %s cancel refused (%s), ignoring"
+                                        % (order["id"], exc))
+                                break
+                    except Exception as exc:  # noqa: BLE001 - best effort
+                        log("stale GTC cleanup failed (%s), ignoring" % exc)
                 in_window = ENTRY_START <= now.time() < ENTRY_END
                 # Cancel a working entry when the window ends: no entries
                 # after 12:00 p.m. PT, so a stale order must not fill late.

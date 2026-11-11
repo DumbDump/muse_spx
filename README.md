@@ -385,3 +385,19 @@ to go in the money. The 0DTE $5-wide spreads were paying only
 kept falling back to the $1.00 limit on the out-of-the-money
 strikes; 8 steps lets it reach strikes close enough to the money
 to actually pay $1.00.
+
+## Trend worker GTC take-profit (Nov 11)
+
+The trend worker now places a standing GTC take-profit when a
+position opens: a debit (buy-back) order at 50% of the credit
+received, GTC. The poll-based exits (50% profit target, 2x stop,
+12:55 p.m. PT hard exit) remain as a fallback. Any close cancels
+the working GTC first, and a new GTC is placed when the next
+position opens — so a close at the max-loss stop always clears the
+old GTC and the next entry gets a fresh one. A credit entry ignores
+debit orders (a debit order is the GTC or a close for a position
+that may be gone), so a stale GTC can never block a new entry; a
+stale GTC is also cancelled once per run when flat (best effort).
+The worker adopts a working GTC by its leg symbols on startup,
+since Tradier does not echo the tag back, so no duplicate GTC is
+ever placed.
