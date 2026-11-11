@@ -26,10 +26,10 @@ Implements one fixed rule set, nothing else:
   limit credit order at the spread's mid, floored at $1.00 (MIN_CREDIT).
   The legs are chosen so the spread pays at least $1.00: when the
   ~0.5% out-of-the-money spread pays less, the strikes move toward
-  the money until the credit reaches $1.00 (up to 4 steps, never
-  letting the short strike go in the money). If no nearby strikes
-  reach $1.00, the limit is placed AT $1.00 and sits working until
-  the spread's value rises to it. It stays working while the
+  the money until the credit reaches $1.00 (up to 8 steps, $40,
+  never letting the short strike go in the money). If no nearby
+  strikes reach $1.00, the limit is placed AT $1.00 and sits working
+  until the spread's value rises to it. It stays working while the
   trend still matches, and is cancelled if the trend flips or the
   window ends. A trend flip while holding does NOT close and reverse:
   the open position is held until an exit fires.
@@ -114,7 +114,7 @@ MIN_CREDIT = float(os.environ.get("MIN_CREDIT", "1.00"))
 MAX_CREDIT = float(os.environ.get("MAX_CREDIT", "2.50"))
 MIN_LEG_VOLUME = int(os.environ.get("MIN_LEG_VOLUME", "10"))
 MAX_SHIFT_STEPS = int(os.environ.get("MAX_SHIFT_STEPS", "3"))
-MAX_CREDIT_STEPS = int(os.environ.get("MAX_CREDIT_STEPS", "4"))
+MAX_CREDIT_STEPS = int(os.environ.get("MAX_CREDIT_STEPS", "8"))
 EMA_FAST = int(os.environ.get("EMA_FAST", "9"))
 EMA_SLOW = int(os.environ.get("EMA_SLOW", "21"))
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx-trend")

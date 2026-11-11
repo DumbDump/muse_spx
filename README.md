@@ -374,3 +374,14 @@ Note: a spread that pays $1.00 has its short strike closer to the
 money than a 0.5% out-of-the-money spread, so it carries more
 delta risk; the 50% profit target and 2x stop still apply to the
 credit actually received.
+
+## Trend worker credit search steps raised (Nov 11)
+
+`MAX_CREDIT_STEPS` raised from 4 to 8, so the trend worker's
+credit search can move up to $40 toward the money (8 x $5) to find
+legs paying at least $1.00. The short strike is still never allowed
+to go in the money. The 0DTE $5-wide spreads were paying only
+~$0.15–$0.22 even after 4 steps toward the money, so the search
+kept falling back to the $1.00 limit on the out-of-the-money
+strikes; 8 steps lets it reach strikes close enough to the money
+to actually pay $1.00.
