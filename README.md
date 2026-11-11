@@ -358,3 +358,19 @@ skipped. When the mid is above $1.00, the limit is the mid. A
 spread above the $2.50 maximum credit is still rejected. Note: a
 fill at the $1.00 floor means the market moved toward the strikes,
 so the spread is closer to the money than a mid-priced entry.
+
+## Trend worker credit search (Nov 11)
+
+The legs are chosen so the spread pays at least $1.00. When the
+~0.5% out-of-the-money spread pays less, the whole spread shifts
+one $5 step toward the money — up for a bull put spread, down for
+a bear call spread — and is re-checked, up to `MAX_CREDIT_STEPS`
+(default 4). Strikes that are already held are skipped, and the
+short strike is never allowed to go in the money. If no nearby
+strikes reach $1.00, the limit is placed AT $1.00 on the
+out-of-the-money strikes and sits working until the spread's value
+rises to it. A spread above the $2.50 maximum is still rejected.
+Note: a spread that pays $1.00 has its short strike closer to the
+money than a 0.5% out-of-the-money spread, so it carries more
+delta risk; the 50% profit target and 2x stop still apply to the
+credit actually received.

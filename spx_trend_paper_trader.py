@@ -23,10 +23,13 @@ Implements one fixed rule set, nothing else:
   entry is skipped rather than doubling up on a leg.
 - Entry window 7:00 a.m.-12:00 p.m. America/Los_Angeles (10:00 a.m.-
   3:00 p.m. ET), weekdays only. One position at a time. An entry is one
-  limit credit order at the spread's mid, floored at $1.00 (MIN_CREDIT):
-  when the mid is below the floor, the limit is placed AT $1.00 and
-  sits working until the spread's value rises to it, instead of the
-  spread being rejected. It stays working while the
+  limit credit order at the spread's mid, floored at $1.00 (MIN_CREDIT).
+  The legs are chosen so the spread pays at least $1.00: when the
+  ~0.5% out-of-the-money spread pays less, the strikes move toward
+  the money until the credit reaches $1.00 (up to 4 steps, never
+  letting the short strike go in the money). If no nearby strikes
+  reach $1.00, the limit is placed AT $1.00 and sits working until
+  the spread's value rises to it. It stays working while the
   trend still matches, and is cancelled if the trend flips or the
   window ends. A trend flip while holding does NOT close and reverse:
   the open position is held until an exit fires.
@@ -111,6 +114,7 @@ MIN_CREDIT = float(os.environ.get("MIN_CREDIT", "1.00"))
 MAX_CREDIT = float(os.environ.get("MAX_CREDIT", "2.50"))
 MIN_LEG_VOLUME = int(os.environ.get("MIN_LEG_VOLUME", "10"))
 MAX_SHIFT_STEPS = int(os.environ.get("MAX_SHIFT_STEPS", "3"))
+MAX_CREDIT_STEPS = int(os.environ.get("MAX_CREDIT_STEPS", "4"))
 EMA_FAST = int(os.environ.get("EMA_FAST", "9"))
 EMA_SLOW = int(os.environ.get("EMA_SLOW", "21"))
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx-trend")
@@ -331,63 +335,10 @@ def held_spxw_strikes(account):
     return strikes
 
 
-def select_spread(spx, direction, chain, expiry, held_strikes):
-    """Pick the 0DTE vertical for the trend direction. Returns
-    (short_strike, long_strike, kind, limit, legs) or (None, reason).
-    Bull: sell the put ~OTM_PCT below SPX, buy the put WIDTH lower.
-    Bear: sell the call ~OTM_PCT above SPX, buy the call WIDTH higher.
-    Strikes snap to the nearest listed $5 strike. If either leg's
-    strike is already held in an open SPXW position (any lane), the
-    whole spread shifts one $5 step further out of the money — down
-    for puts, up for calls — and is re-checked, up to
-    MAX_SHIFT_STEPS times. If every nearby strike is held, the entry
-    is skipped. Both legs must have a two-sided quote and at least
-    MIN_LEG_VOLUME traded, and the mid-based credit must not exceed
-    MAX_CREDIT. The order's limit is the mid credit floored at
-    MIN_CREDIT: when the mid is below the $1.00 floor, the limit is
-    placed AT $1.00 and sits working until the spread's value rises
-    to it, instead of the spread being rejected outright. A fill at
-    the floor means the market moved toward the strikes, so the
-    spread is closer to the money than a mid-priced entry."""
-    if direction == "bull":
-        kind = "put"
-        target = spx * (1 - OTM_PCT)
-        strikes = sorted(s for (s, k) in chain if k == "put")
-        below = [s for s in strikes if s <= target]
-        if not below:
-            return None, "no put strike at or below %.2f" % target
-        short_strike = int(max(below))
-        long_strike = short_strike - SPREAD_WIDTH
-    else:
-        kind = "call"
-        target = spx * (1 + OTM_PCT)
-        strikes = sorted(s for (s, k) in chain if k == "call")
-        above = [s for s in strikes if s >= target]
-        if not above:
-            return None, "no call strike at or above %.2f" % target
-        short_strike = int(min(above))
-        long_strike = short_strike + SPREAD_WIDTH
-    # Leg-collision avoidance: if either leg's strike is already held
-    # in an open SPXW position (any lane), shift the whole spread one
-    # $5 step further out of the money — down for puts, up for calls —
-    # and re-check, up to MAX_SHIFT_STEPS times. If every nearby
-    # strike is held, skip the entry instead of doubling up on a leg.
-    shifts = 0
-    while (float(short_strike) in held_strikes
-           or float(long_strike) in held_strikes):
-        if shifts >= MAX_SHIFT_STEPS:
-            return None, "strikes near %d/%d held after %d shifts, skipping" % (
-                short_strike, long_strike, shifts)
-        if direction == "bull":
-            short_strike -= SPREAD_WIDTH
-            long_strike -= SPREAD_WIDTH
-        else:
-            short_strike += SPREAD_WIDTH
-            long_strike += SPREAD_WIDTH
-        shifts += 1
-    if shifts:
-        log("spread shifted %d step(s) to %d/%d to avoid held strikes"
-            % (shifts, short_strike, long_strike))
+def _credit_for(chain, short_strike, long_strike, kind):
+    """Mid-based credit for a $5-wide spread, or (None, reason) when a
+    leg is missing, has no two-sided quote, or is below the volume
+    floor."""
     short_opt = chain.get((float(short_strike), kind))
     long_opt = chain.get((float(long_strike), kind))
     if short_opt is None or long_opt is None:
@@ -401,17 +352,125 @@ def select_spread(spx, direction, chain, expiry, held_strikes):
                     label, kind, opt.get("volume"), MIN_LEG_VOLUME)
         except (KeyError, TypeError, ValueError):
             return None, "%s %s leg quote unreadable" % (label, kind)
-    credit = round(chain_mid(short_opt) - chain_mid(long_opt), 2)
-    if credit > MAX_CREDIT:
-        return None, "credit %.2f above %.2f" % (credit, MAX_CREDIT)
-    # Floor the order's limit at MIN_CREDIT: when the mid is below
-    # the floor, place the limit AT the floor and let it sit working
-    # until the spread's value rises to it, instead of rejecting the
-    # spread outright.
-    limit = max(credit, MIN_CREDIT)
-    if limit > credit:
-        log("mid credit %.2f below $%.2f floor — limit placed at $%.2f"
-            % (credit, MIN_CREDIT, limit))
+    return round(chain_mid(short_opt) - chain_mid(long_opt), 2), None
+
+
+def select_spread(spx, direction, chain, expiry, held_strikes):
+    """Pick the 0DTE vertical for the trend direction. Returns
+    (short_strike, long_strike, kind, limit, legs) or (None, reason).
+    Bull: sell the put ~OTM_PCT below SPX, buy the put WIDTH lower.
+    Bear: sell the call ~OTM_PCT above SPX, buy the call WIDTH higher.
+    Strikes snap to the nearest listed $5 strike. If either leg's
+    strike is already held in an open SPXW position (any lane), the
+    whole spread shifts one $5 step further out of the money — down
+    for puts, up for calls — and is re-checked, up to
+    MAX_SHIFT_STEPS times. If every nearby strike is held, the entry
+    is skipped. The legs are then chosen so the spread pays at least
+    MIN_CREDIT: when the mid credit is below the $1.00 floor, the
+    whole spread shifts one $5 step TOWARD the money — up for puts,
+    down for calls — and is re-checked, up to MAX_CREDIT_STEPS
+    times, skipping strikes that are held and never letting the short
+    strike go in the money. If no nearby strikes reach the floor,
+    the limit is placed AT the floor on the out-of-the-money strikes
+    and sits working until the spread's value rises to it. A spread
+    above MAX_CREDIT is still rejected."""
+    if direction == "bull":
+        kind = "put"
+        target = spx * (1 - OTM_PCT)
+        strikes = sorted(s for (s, k) in chain if k == "put")
+        below = [s for s in strikes if s <= target]
+        if not below:
+            return None, "no put strike at or below %.2f" % target
+        short_strike = int(max(below))
+        long_strike = short_strike - SPREAD_WIDTH
+        toward = SPREAD_WIDTH    # up, closer to SPX
+        away = -SPREAD_WIDTH     # down, further out of the money
+        def otm_ok(s):
+            return s < spx
+    else:
+        kind = "call"
+        target = spx * (1 + OTM_PCT)
+        strikes = sorted(s for (s, k) in chain if k == "call")
+        above = [s for s in strikes if s >= target]
+        if not above:
+            return None, "no call strike at or above %.2f" % target
+        short_strike = int(min(above))
+        long_strike = short_strike + SPREAD_WIDTH
+        toward = -SPREAD_WIDTH   # down, closer to SPX
+        away = SPREAD_WIDTH      # up, further out of the money
+        def otm_ok(s):
+            return s > spx
+    # Leg-collision avoidance: if either leg's strike is already held
+    # in an open SPXW position (any lane), shift the whole spread one
+    # $5 step further out of the money and re-check, up to
+    # MAX_SHIFT_STEPS times. If every nearby strike is held, skip the
+    # entry instead of doubling up on a leg.
+    shifts = 0
+    while (float(short_strike) in held_strikes
+           or float(long_strike) in held_strikes):
+        if shifts >= MAX_SHIFT_STEPS:
+            return None, "strikes near %d/%d held after %d shifts, skipping" % (
+                short_strike, long_strike, shifts)
+        short_strike += away
+        long_strike += away
+        shifts += 1
+    if shifts:
+        log("spread shifted %d step(s) to %d/%d to avoid held strikes"
+            % (shifts, short_strike, long_strike))
+    base_short, base_long = short_strike, long_strike
+    # Credit search: choose legs that pay at least MIN_CREDIT. When
+    # the mid credit is below the floor, shift the whole spread one
+    # $5 step toward the money and re-check, up to MAX_CREDIT_STEPS
+    # times, skipping strikes that are held and never letting the
+    # short strike go in the money.
+    credit = None
+    credit_steps = 0
+    while credit_steps <= MAX_CREDIT_STEPS:
+        if (float(short_strike) in held_strikes
+                or float(long_strike) in held_strikes):
+            # These strikes are held: move one step toward the money
+            # instead of using them.
+            if credit_steps >= MAX_CREDIT_STEPS:
+                break
+            new_short = short_strike + toward
+            if not otm_ok(new_short):
+                break
+            short_strike += toward
+            long_strike += toward
+            credit_steps += 1
+            continue
+        credit, reason = _credit_for(chain, short_strike, long_strike, kind)
+        if credit is None:
+            return None, reason
+        if credit > MAX_CREDIT:
+            return None, "credit %.2f above %.2f" % (credit, MAX_CREDIT)
+        if credit >= MIN_CREDIT:
+            break
+        if credit_steps >= MAX_CREDIT_STEPS:
+            break
+        new_short = short_strike + toward
+        if not otm_ok(new_short):
+            break
+        short_strike += toward
+        long_strike += toward
+        credit_steps += 1
+    if credit is not None and credit >= MIN_CREDIT:
+        if credit_steps:
+            log("spread moved %d step(s) toward the money to %d/%d "
+                "for $%.2f credit"
+                % (credit_steps, short_strike, long_strike, credit))
+        limit = credit
+    else:
+        # No nearby strikes reach the floor: fall back to the limit
+        # floor on the out-of-the-money base strikes.
+        short_strike, long_strike = base_short, base_long
+        credit, reason = _credit_for(chain, short_strike, long_strike, kind)
+        if credit is None:
+            return None, reason
+        limit = MIN_CREDIT
+        log("mid credit %.2f below $%.2f floor after %d step(s) — "
+            "limit placed at $%.2f"
+            % (credit, MIN_CREDIT, credit_steps, limit))
     legs = [
         ("sell_to_open", option_symbol(expiry, short_strike, "P" if kind == "put" else "C"), CONTRACTS),
         ("buy_to_open", option_symbol(expiry, long_strike, "P" if kind == "put" else "C"), CONTRACTS),
