@@ -20,7 +20,12 @@ Implements one fixed rule set, nothing else:
   opens the position. An unfilled cycle cancels and waits 5 minutes
   before the next cycle. Pairs over $12.00 are logged with their actual
   price and retried next poll.
-- Max 5 contracts per trade, one position at a time.
+- Max 5 contracts per trade, one position at a time — enforced by a
+  hard gate, not just the per-poll read: before a walk-up cycle starts,
+  and before every walk-up step, the worker re-reads open positions
+  and aborts if any SPXW calendar legs expiring after today are held.
+  A stale or empty positions read at poll time can never open a second
+  calendar, because the gate is re-checked fresh at entry time.
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
   worker places a GTC credit order to close the position at 110% of the
   debit actually paid, so the exit triggers the moment the market touches
@@ -575,6 +580,29 @@ def cleanup_stale_take_profit_orders(account):
                 "entry path ignores it" % (order["id"], exc))
 
 
+def has_open_calendar(account):
+    """True when the paper account holds any open SPXW calendar legs
+    expiring after today — i.e. this worker already has a position.
+    This is the hard one-position gate: it re-reads positions fresh
+    from Tradier (never trusting a cached or poll-start read), so a
+    stale or empty positions feed at poll time cannot let a second
+    calendar open. The trend worker's 0DTE legs expire today and are
+    excluded, so they never block this worker's entry."""
+    today = datetime.now(TZ).date()
+    try:
+        for p in get_positions(account):
+            sym = str(p.get("symbol", ""))
+            if not sym.startswith("SPXW"):
+                continue
+            exp = _expiry_from_symbol(sym)
+            if exp is not None and exp > today:
+                return True
+    except Exception as exc:  # noqa: BLE001 - a failed read is not "flat"
+        log("one-position gate: positions read failed (%s), treating as holding" % exc)
+        return True
+    return False
+
+
 def run_walkup_cycle(account, short_exp, long_exp, put, call):
     """Bid a pair from WALK_START up to MAX_DEBIT in WALK_STEP steps.
 
@@ -596,6 +624,13 @@ def run_walkup_cycle(account, short_exp, long_exp, put, call):
     price = WALK_START
     while price <= MAX_DEBIT + 1e-9:
         price = round(price, 2)
+        # Hard one-position gate, re-checked before every step: if a
+        # calendar opened since the cycle started (a fill the poll-start
+        # read missed, or a position from another lane), abort the
+        # cycle instead of opening a second calendar.
+        if has_open_calendar(account):
+            log("walk-up: a calendar is already open, cycle aborted at %.2f" % price)
+            return False
         resp = place_order(account, "debit", price, legs)
         if resp.get("blocked"):
             log("walk-up: blocked by an existing pending order, cycle aborted")
@@ -766,6 +801,15 @@ def run_once():
                                 % (MAX_DEBIT, spx))
                     else:
                         short_exp, long_exp, put, call, debit = pair
+                        # Hard one-position gate, checked fresh right
+                        # before the cycle: the poll-start positions read
+                        # may be stale, so never start a walk-up on its
+                        # word alone.
+                        if has_open_calendar(account):
+                            log("entry: a calendar is already open, skipping entry "
+                                "(SPX %.2f)" % spx)
+                            time.sleep(POLL_SECONDS)
+                            continue
                         log("entry: SPX %.2f short %s / long %s %dP/%dC modeled debit %.2f x %d"
                             % (spx, short_exp, long_exp, put, call, debit, CONTRACTS))
                         filled = run_walkup_cycle(account, short_exp, long_exp, put, call)

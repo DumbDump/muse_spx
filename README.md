@@ -401,3 +401,16 @@ stale GTC is also cancelled once per run when flat (best effort).
 The worker adopts a working GTC by its leg symbols on startup,
 since Tradier does not echo the tag back, so no duplicate GTC is
 ever placed.
+
+## SPX worker one-position gate (Nov 11)
+
+The SPX worker opened three calendars at once on Nov 11 (7555P/7655C
+at $9.80, 7560P/7660C at $10.80, 7575P/7675C at $12.00) despite the
+one-position-at-a-time rule. The per-poll positions read can be stale
+or empty right after a fill, and once a walk-up cycle starts the worker
+does not re-check positions until the cycle ends — so a second and third
+calendar opened. Fix: a hard `has_open_calendar()` gate that re-reads
+open positions fresh from Tradier. It is checked right before a walk-up
+cycle starts AND before every walk-up step, and a failed positions read
+is treated as "holding" (fail-safe). The trend worker's 0DTE legs expire
+today and are excluded, so they never block this worker's entry.
