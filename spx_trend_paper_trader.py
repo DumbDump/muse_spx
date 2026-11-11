@@ -12,8 +12,15 @@ Implements one fixed rule set, nothing else:
   prior sessions' bars so it is valid from the open. (VWAP is NOT used:
   SPX is an index and Tradier's timesales returns volume 0 for it, so a
   volume-weighted average cannot be computed from this feed.)
-- Spreads are $5 wide, 1 contract, short leg ~0.5% out of the money
+- Spreads are $5 wide, short leg ~0.5% out of the money
   (snapped to the nearest listed $5 strike), long leg $5 further out.
+  Contracts per trade come from CONTRACTS (default 1).
+- Leg-collision avoidance: before entering, the worker reads every
+  open SPXW position in the paper account. If either leg's strike is
+  already held by another strategy, the whole spread shifts one $5
+  step further out of the money (down for puts, up for calls) and is
+  re-checked, up to 3 steps; if every nearby strike is held, the
+  entry is skipped rather than doubling up on a leg.
 - Entry window 7:00 a.m.-12:00 p.m. America/Los_Angeles (10:00 a.m.-
   3:00 p.m. ET), weekdays only. One position at a time. An entry is one
   limit credit order at the spread's mid; it stays working while the
@@ -100,6 +107,7 @@ STOP_MULTIPLE = float(os.environ.get("STOP_MULTIPLE", "2.0"))
 MIN_CREDIT = float(os.environ.get("MIN_CREDIT", "0.15"))
 MAX_CREDIT = float(os.environ.get("MAX_CREDIT", "2.50"))
 MIN_LEG_VOLUME = int(os.environ.get("MIN_LEG_VOLUME", "10"))
+MAX_SHIFT_STEPS = int(os.environ.get("MAX_SHIFT_STEPS", "3"))
 EMA_FAST = int(os.environ.get("EMA_FAST", "9"))
 EMA_SLOW = int(os.environ.get("EMA_SLOW", "21"))
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-spx-trend")
@@ -304,14 +312,35 @@ def trend_direction():
     return None, f, s
 
 
-def select_spread(spx, direction, chain, expiry):
+def held_spxw_strikes(account):
+    """Strikes currently held in any open SPXW position in the paper
+    account, whatever lane opened them. Used to avoid opening a spread
+    on a strike another strategy already holds."""
+    strikes = set()
+    for p in get_positions(account):
+        sym = str(p.get("symbol", ""))
+        if not sym.startswith("SPXW"):
+            continue
+        # Symbol: SPXW + YYMMDD + P/C + 8-digit strike (strike x 1000).
+        m = re.search(r"[PC](\d{8})$", sym)
+        if m:
+            strikes.add(float(m.group(1)) / 1000.0)
+    return strikes
+
+
+def select_spread(spx, direction, chain, expiry, held_strikes):
     """Pick the 0DTE vertical for the trend direction. Returns
     (short_strike, long_strike, kind, credit, legs) or (None, reason).
     Bull: sell the put ~OTM_PCT below SPX, buy the put WIDTH lower.
     Bear: sell the call ~OTM_PCT above SPX, buy the call WIDTH higher.
-    Strikes snap to the nearest listed $5 strike. Both legs must have
-    a two-sided quote and at least MIN_LEG_VOLUME traded, and the
-    mid-based credit must sit inside [MIN_CREDIT, MAX_CREDIT]."""
+    Strikes snap to the nearest listed $5 strike. If either leg's
+    strike is already held in an open SPXW position (any lane), the
+    whole spread shifts one $5 step further out of the money — down
+    for puts, up for calls — and is re-checked, up to
+    MAX_SHIFT_STEPS times. If every nearby strike is held, the entry
+    is skipped. Both legs must have a two-sided quote and at least
+    MIN_LEG_VOLUME traded, and the mid-based credit must sit inside
+    [MIN_CREDIT, MAX_CREDIT]."""
     if direction == "bull":
         kind = "put"
         target = spx * (1 - OTM_PCT)
@@ -330,6 +359,27 @@ def select_spread(spx, direction, chain, expiry):
             return None, "no call strike at or above %.2f" % target
         short_strike = int(min(above))
         long_strike = short_strike + SPREAD_WIDTH
+    # Leg-collision avoidance: if either leg's strike is already held
+    # in an open SPXW position (any lane), shift the whole spread one
+    # $5 step further out of the money — down for puts, up for calls —
+    # and re-check, up to MAX_SHIFT_STEPS times. If every nearby
+    # strike is held, skip the entry instead of doubling up on a leg.
+    shifts = 0
+    while (float(short_strike) in held_strikes
+           or float(long_strike) in held_strikes):
+        if shifts >= MAX_SHIFT_STEPS:
+            return None, "strikes near %d/%d held after %d shifts, skipping" % (
+                short_strike, long_strike, shifts)
+        if direction == "bull":
+            short_strike -= SPREAD_WIDTH
+            long_strike -= SPREAD_WIDTH
+        else:
+            short_strike += SPREAD_WIDTH
+            long_strike += SPREAD_WIDTH
+        shifts += 1
+    if shifts:
+        log("spread shifted %d step(s) to %d/%d to avoid held strikes"
+            % (shifts, short_strike, long_strike))
     short_opt = chain.get((float(short_strike), kind))
     long_opt = chain.get((float(long_strike), kind))
     if short_opt is None or long_opt is None:
@@ -670,7 +720,8 @@ def run_once():
                     log("no 0DTE chain data, skipping")
                     time.sleep(POLL_SECONDS)
                     continue
-                selected, reason = select_spread(spx, direction, chain, today)
+                held = held_spxw_strikes(account)
+                selected, reason = select_spread(spx, direction, chain, today, held)
                 if selected is None:
                     log("no %s spread: %s (SPX %.2f)" % (direction, reason, spx))
                     time.sleep(POLL_SECONDS)

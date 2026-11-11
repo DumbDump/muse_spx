@@ -328,3 +328,15 @@ Fix (commit, Nov 11): each worker only manages its own legs.
   calendar is invisible to it.
 - QQQ (QQQ root) and Nasdaq (single names) never shared a symbol
   prefix with SPXW, so they needed no change.
+
+## Leg-collision avoidance (Nov 11)
+
+The trend worker checks the paper account's open SPXW positions
+before entering. If either leg's strike is already held by another
+strategy, the whole spread shifts one $5 step further out of the
+money — down for a bull put spread, up for a bear call spread — and
+is re-checked, up to `MAX_SHIFT_STEPS` (default 3). If every nearby
+strike is held, the entry is skipped rather than doubling up on a
+leg. Example: it wants 7580/7575 but 7580 is already open, so it
+trades 7575/7570 instead. The credit and volume checks still apply
+to the shifted legs.
