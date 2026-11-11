@@ -347,3 +347,14 @@ The trend worker's minimum credit is now $1.00 per share (was
 $0.15). The credit window is [$1.00, $2.50]. A spread whose
 mid-based credit is below $1.00 is skipped. This is the code
 default (`MIN_CREDIT`, overridable by the env var of the same name).
+
+## Trend worker limit floored at the $1.00 minimum (Nov 11)
+
+The $1.00 minimum credit is now a floor on the entry order's
+limit, not a rejection. When a spread's mid-based credit is below
+$1.00, the limit order is placed AT $1.00 and sits working until
+the spread's value rises to it, instead of the spread being
+skipped. When the mid is above $1.00, the limit is the mid. A
+spread above the $2.50 maximum credit is still rejected. Note: a
+fill at the $1.00 floor means the market moved toward the strikes,
+so the spread is closer to the money than a mid-priced entry.

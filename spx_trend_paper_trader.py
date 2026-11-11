@@ -23,7 +23,10 @@ Implements one fixed rule set, nothing else:
   entry is skipped rather than doubling up on a leg.
 - Entry window 7:00 a.m.-12:00 p.m. America/Los_Angeles (10:00 a.m.-
   3:00 p.m. ET), weekdays only. One position at a time. An entry is one
-  limit credit order at the spread's mid; it stays working while the
+  limit credit order at the spread's mid, floored at $1.00 (MIN_CREDIT):
+  when the mid is below the floor, the limit is placed AT $1.00 and
+  sits working until the spread's value rises to it, instead of the
+  spread being rejected. It stays working while the
   trend still matches, and is cancelled if the trend flips or the
   window ends. A trend flip while holding does NOT close and reverse:
   the open position is held until an exit fires.
@@ -330,7 +333,7 @@ def held_spxw_strikes(account):
 
 def select_spread(spx, direction, chain, expiry, held_strikes):
     """Pick the 0DTE vertical for the trend direction. Returns
-    (short_strike, long_strike, kind, credit, legs) or (None, reason).
+    (short_strike, long_strike, kind, limit, legs) or (None, reason).
     Bull: sell the put ~OTM_PCT below SPX, buy the put WIDTH lower.
     Bear: sell the call ~OTM_PCT above SPX, buy the call WIDTH higher.
     Strikes snap to the nearest listed $5 strike. If either leg's
@@ -339,8 +342,13 @@ def select_spread(spx, direction, chain, expiry, held_strikes):
     for puts, up for calls — and is re-checked, up to
     MAX_SHIFT_STEPS times. If every nearby strike is held, the entry
     is skipped. Both legs must have a two-sided quote and at least
-    MIN_LEG_VOLUME traded, and the mid-based credit must sit inside
-    [MIN_CREDIT, MAX_CREDIT]."""
+    MIN_LEG_VOLUME traded, and the mid-based credit must not exceed
+    MAX_CREDIT. The order's limit is the mid credit floored at
+    MIN_CREDIT: when the mid is below the $1.00 floor, the limit is
+    placed AT $1.00 and sits working until the spread's value rises
+    to it, instead of the spread being rejected outright. A fill at
+    the floor means the market moved toward the strikes, so the
+    spread is closer to the money than a mid-priced entry."""
     if direction == "bull":
         kind = "put"
         target = spx * (1 - OTM_PCT)
@@ -394,14 +402,21 @@ def select_spread(spx, direction, chain, expiry, held_strikes):
         except (KeyError, TypeError, ValueError):
             return None, "%s %s leg quote unreadable" % (label, kind)
     credit = round(chain_mid(short_opt) - chain_mid(long_opt), 2)
-    if credit < MIN_CREDIT or credit > MAX_CREDIT:
-        return None, "credit %.2f outside [%.2f, %.2f]" % (
-            credit, MIN_CREDIT, MAX_CREDIT)
+    if credit > MAX_CREDIT:
+        return None, "credit %.2f above %.2f" % (credit, MAX_CREDIT)
+    # Floor the order's limit at MIN_CREDIT: when the mid is below
+    # the floor, place the limit AT the floor and let it sit working
+    # until the spread's value rises to it, instead of rejecting the
+    # spread outright.
+    limit = max(credit, MIN_CREDIT)
+    if limit > credit:
+        log("mid credit %.2f below $%.2f floor — limit placed at $%.2f"
+            % (credit, MIN_CREDIT, limit))
     legs = [
         ("sell_to_open", option_symbol(expiry, short_strike, "P" if kind == "put" else "C"), CONTRACTS),
         ("buy_to_open", option_symbol(expiry, long_strike, "P" if kind == "put" else "C"), CONTRACTS),
     ]
-    return (short_strike, long_strike, kind, credit, legs), None
+    return (short_strike, long_strike, kind, limit, legs), None
 
 
 def get_pending_orders(account):
@@ -747,7 +762,7 @@ def run_once():
                         time.sleep(POLL_SECONDS)
                         continue
                 log("entry: SPX %.2f %s EMA %d %.2f / EMA %d %.2f, %s %d/%d %s "
-                    "credit %.2f x %d"
+                    "limit %.2f x %d"
                     % (spx, direction, EMA_FAST, ema_fast, EMA_SLOW, ema_slow,
                        kind, short_strike, long_strike,
                        "bull put" if kind == "put" else "bear call",
