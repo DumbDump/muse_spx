@@ -632,23 +632,90 @@ def _expiry_from_symbol(symbol):
     return date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6]))
 
 
-def position_value_and_basis(account):
-    """Return (buyback, credit, legs) for the open SPX trend spread.
-    Only this worker's own 0DTE vertical is returned: legs expiring
-    today. A multi-day double calendar (the SPX worker's position)
-    has legs expiring after today and is ignored, so this worker never
-    manages another lane's position. The worker shorts the spread, so
-    the position's market value is negative (what it would cost to buy
-    back) and its cost basis is negative (the credit received).
-    buyback = -value, credit = -basis, P&L = credit - buyback.
-    Returns (0.0, 0.0, []) when flat."""
+def _leg_kind_strike(symbol):
+    """(kind, strike) from an SPXW symbol, or (None, None)."""
+    m = re.search(r"([PC])(\d{8})$", str(symbol))
+    if not m:
+        return None, None
+    return ("put" if m.group(1) == "P" else "call", float(m.group(2)) / 1000.0)
+
+
+def group_0dte_spreads(legs):
+    """Group 0DTE position legs into vertical spreads. Each spread is a
+    list of position dicts: one short + one long, same kind, strikes
+    SPREAD_WIDTH apart, same |quantity|. Returns a list of spreads;
+    unpaired legs are dropped. This matters when the account holds
+    more than one 0DTE spread (e.g. the worker's own plus a manual
+    one): the worker must manage only its own spread, never a
+    mixture of legs from two spreads."""
+    shorts = []
+    longs = []
+    for leg in legs:
+        kind, strike = _leg_kind_strike(leg.get("symbol", ""))
+        if kind is None:
+            continue
+        qty = float(leg.get("quantity", 0))
+        if qty < 0:
+            shorts.append((kind, strike, leg))
+        elif qty > 0:
+            longs.append((kind, strike, leg))
+    spreads = []
+    used_longs = set()
+    for kind, s_strike, s_leg in shorts:
+        # Long leg is WIDTH further OTM: puts lower, calls higher.
+        want = s_strike - SPREAD_WIDTH if kind == "put" else s_strike + SPREAD_WIDTH
+        for i, (l_kind, l_strike, l_leg) in enumerate(longs):
+            if i in used_longs:
+                continue
+            if (l_kind == kind and l_strike == want
+                    and abs(float(l_leg.get("quantity", 0))) == abs(float(s_leg.get("quantity", 0)))):
+                spreads.append([s_leg, l_leg])
+                used_longs.add(i)
+                break
+    return spreads
+
+
+def position_value_and_basis(account, entry=None):
+    """Return (buyback, credit, legs) for the open SPX trend spread —
+    the worker's OWN spread only. Only legs expiring today. A
+    multi-day double calendar (the SPX worker's position) has legs
+    expiring after today and is ignored, so this worker never manages
+    another lane's position. When the account holds more than one
+    0DTE spread (e.g. a manual spread alongside the worker's), the
+    legs are grouped into spreads and only one is returned: the one
+    matching the entry the worker placed (entry's short/long
+    strikes), else the first spread. This prevents a GTC or close
+    from being built out of legs from two different spreads — the
+    bug that produced a rejected order with mixed legs. The worker
+    shorts the spread, so the position's market value is negative
+    (what it would cost to buy back) and its cost basis is negative
+    (the credit received). buyback = -value, credit = -basis,
+    P&L = credit - buyback. Returns (0.0, 0.0, []) when flat."""
     today = datetime.now(TZ).date()
     legs = [p for p in get_positions(account)
             if str(p.get("symbol", "")).startswith("SPXW")
             and _expiry_from_symbol(str(p.get("symbol", ""))) == today]
     if not legs:
         return 0.0, 0.0, []
-    symbols = ",".join(p["symbol"] for p in legs)
+    spreads = group_0dte_spreads(legs)
+    if not spreads:
+        # No clean pairing (e.g. a single leg, or legs that don't form
+        # a $5-wide vertical): fall back to all legs so the worker
+        # still reports the position instead of claiming flat.
+        chosen = legs
+    elif entry is not None:
+        chosen = None
+        for sp in spreads:
+            strikes = {_leg_kind_strike(l.get("symbol", ""))[1] for l in sp}
+            if (float(entry["short_strike"]) in strikes
+                    and float(entry["long_strike"]) in strikes):
+                chosen = sp
+                break
+        if chosen is None:
+            chosen = spreads[0]
+    else:
+        chosen = spreads[0]
+    symbols = ",".join(p["symbol"] for p in chosen)
     data = api_get("/v1/markets/quotes?symbols=%s&greeks=false" % symbols)
     quotes = data["quotes"]["quote"]
     if isinstance(quotes, dict):
@@ -656,11 +723,11 @@ def position_value_and_basis(account):
     mids = {q["symbol"]: (float(q["bid"]) + float(q["ask"])) / 2.0 for q in quotes}
     value = 0.0
     basis = 0.0
-    for leg in legs:
+    for leg in chosen:
         mid = mids.get(leg["symbol"], 0.0)
         value += float(leg["quantity"]) * mid * 100.0
         basis += float(leg["cost_basis"])
-    return -value, -basis, legs
+    return -value, -basis, chosen
 
 
 def find_gtc_for_legs(account, close_legs):
@@ -703,15 +770,17 @@ def place_gtc_take_profit(account, legs, credit):
     return order.get("id")
 
 
-def close_position(account, legs, reason):
+def close_position(account, legs, reason, entry=None):
     """Buy back the open spread at the mid. Cancels a blocking order
     first — the working GTC take-profit, or an unfilled entry for the
     same strikes — so the close is the only order working on these
     legs. The close is a DEBIT order for the buy-back cost — the worker
     is short the spread, so closing costs money; a negative or zero
     buy-back is floored at $0.01, since Tradier rejects a zero/negative
-    price. Returns early when the position is already gone."""
-    buyback, credit, fresh_legs = position_value_and_basis(account)
+    price. Returns early when the position is already gone. The
+    `entry` hint keeps the re-read scoped to the worker's own spread
+    when the account holds more than one 0DTE spread."""
+    buyback, credit, fresh_legs = position_value_and_basis(account, entry=entry)
     if not fresh_legs:
         log("closing (%s): position already closed, nothing to do" % reason)
         return {"already_closed": True}
@@ -773,6 +842,11 @@ def run_once():
     # when a position opens. Cancelled on any close; a new one is placed
     # when the next position opens.
     working_gtc = None
+    # The spread the worker is currently managing (the entry dict for
+    # the open position). Kept while a position is open so later polls
+    # keep identifying THIS spread — not a manual spread that may also
+    # be open in the same account. Cleared when flat.
+    open_spread = None
     # Stale-GTC cleanup runs once per process run (best effort).
     gtc_cleanup_done = False
     # Daily round-trip cap: completed round-trips (one entry + its
@@ -794,7 +868,8 @@ def run_once():
                 if now.hour == hour and last_pnl_day.get(hour) != today:
                     pnl_snapshot(account)
                     last_pnl_day[hour] = today
-            buyback, credit, legs = position_value_and_basis(account)
+            buyback, credit, legs = position_value_and_basis(
+                account, entry=open_spread or working_entry)
             # Heartbeat every poll: one short line so the log always shows
             # the worker is alive and what it is doing.
             try:
@@ -827,8 +902,13 @@ def run_once():
             if legs:
                 # A position means any earlier entry order has filled;
                 # cancel a leftover working entry so it cannot open a
-                # second position after this one closes.
+                # second position after this one closes. Remember which
+                # spread is ours (the entry that just filled) so later
+                # polls keep managing THIS spread, not a manual spread
+                # that may also be open.
                 if working_entry is not None:
+                    if open_spread is None:
+                        open_spread = working_entry
                     try:
                         cancel_order(account, working_entry["id"])
                         log("entry order %s cancelled after fill"
@@ -837,9 +917,37 @@ def run_once():
                         log("entry order %s cancel failed (%s), ignoring"
                             % (working_entry["id"], exc))
                     working_entry = None
+                if open_spread is None:
+                    # Adopting a position (e.g. after a restart, or a
+                    # spread opened before this process started): record
+                    # the legs just read as our spread.
+                    kinds = {}
+                    for leg in legs:
+                        kind, strike = _leg_kind_strike(leg.get("symbol", ""))
+                        if kind is not None:
+                            kinds.setdefault(kind, []).append(strike)
+                    for kind, strikes in kinds.items():
+                        if len(strikes) >= 2:
+                            hi, lo = max(strikes), min(strikes)
+                            open_spread = {
+                                "short_strike": hi if kind == "put" else lo,
+                                "long_strike": lo if kind == "put" else hi,
+                                "kind": kind,
+                            }
+                            break
                 # Standing GTC take-profit: place one (buy back at 50%
                 # of the credit) when a position opens. Adopt the
                 # working one after a restart instead of duplicating it.
+                # Verify the tracked GTC is still working each poll: a
+                # GTC canceled or rejected out from under the worker
+                # must be re-placed, not trusted from memory. If the
+                # tracked id no longer matches a working order for
+                # these exact legs, clear it so a fresh one is placed.
+                if working_gtc is not None:
+                    if find_gtc_for_legs(account, close_legs_for(legs)) != working_gtc:
+                        log("tracked GTC %s no longer working, will re-place"
+                            % working_gtc)
+                        working_gtc = None
                 if working_gtc is None:
                     working_gtc = place_gtc_take_profit(account, legs, credit)
                 # HARD EXIT: 12:55 p.m. PT, 5 minutes before the close.
@@ -847,7 +955,8 @@ def run_once():
                 # The close cancels the working GTC first.
                 if now.time() >= HARD_EXIT:
                     log("hard exit 12:55 PT: closing open spread")
-                    close_position(account, legs, "hard exit 12:55 PT")
+                    close_position(account, legs, "hard exit 12:55 PT",
+                                   entry=open_spread or working_entry)
                     working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
@@ -857,7 +966,8 @@ def run_once():
                 if credit > 0 and buyback <= PROFIT_TARGET_FRACTION * credit:
                     log("profit target hit: buyback %.2f on credit %.2f"
                         % (buyback, credit))
-                    close_position(account, legs, "50% profit target")
+                    close_position(account, legs, "50% profit target",
+                                   entry=open_spread or working_entry)
                     working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
@@ -868,14 +978,18 @@ def run_once():
                 if credit > 0 and buyback >= STOP_MULTIPLE * credit:
                     log("stop hit: buyback %.2f on credit %.2f"
                         % (buyback, credit))
-                    close_position(account, legs, "stop 2x credit")
+                    close_position(account, legs, "stop 2x credit",
+                                   entry=open_spread or working_entry)
                     working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
             else:
                 # Flat: the position is gone, so any tracked GTC either
                 # filled or is stale — clear the tracking. A new GTC is
-                # placed when the next position opens.
+                # placed when the next position opens. Clear the open
+                # spread identity too, so the next position is
+                # identified fresh.
+                open_spread = None
                 if working_gtc is not None:
                     working_gtc = None
                 # Best-effort stale-GTC cleanup once per run: a working
