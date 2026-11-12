@@ -655,6 +655,71 @@ def group_0dte_spreads(legs):
     return spreads
 
 
+def find_worker_entry_spread(account, spreads):
+    """Identify the worker's own spread among open 0DTE spreads, for
+    adoption after a restart when the in-memory entry is gone. The
+    worker opens one spread at a time and holds it; it never opens a
+    second spread while the first is open. So among the spreads
+    currently open, the worker's is the one from the EARLIEST filled
+    credit (entry) order: any spread whose entry came later, while
+    the worker's spread was already open, belongs to someone else.
+    Returns an entry-like dict {short_strike, long_strike, kind}, or
+    None when no filled entry matches an open spread."""
+    if not spreads:
+        return None
+    # Read the orders feed directly (all orders, not just pending).
+    try:
+        data = api_get("/v1/accounts/%s/orders" % account)
+    except Exception:
+        return None
+    orders_obj = data.get("orders")
+    if not isinstance(orders_obj, dict):
+        return None
+    orders = orders_obj.get("order")
+    if orders is None:
+        return None
+    if isinstance(orders, dict):
+        orders = [orders]
+    # Map spread leg-symbol sets to the spread, for matching entries.
+    spread_by_symbols = {}
+    for sp in spreads:
+        syms = frozenset(l.get("symbol") for l in sp)
+        spread_by_symbols[syms] = sp
+    best = None  # (create_date, entry dict)
+    for order in orders:
+        if order.get("type") != "credit" or order.get("status") != "filled":
+            continue
+        legs = order.get("leg")
+        if isinstance(legs, dict):
+            legs = [legs]
+        syms = frozenset(l.get("option_symbol") for l in (legs or []))
+        sp = spread_by_symbols.get(syms)
+        if sp is None:
+            continue
+        create = str(order.get("create_date", ""))
+        # Entry dict for this spread.
+        kinds = {}
+        for leg in sp:
+            kind, strike = _leg_kind_strike(leg.get("symbol", ""))
+            if kind is not None:
+                kinds.setdefault(kind, []).append(strike)
+        entry = None
+        for kind, strikes in kinds.items():
+            if len(strikes) >= 2:
+                hi, lo = max(strikes), min(strikes)
+                entry = {
+                    "short_strike": hi if kind == "put" else lo,
+                    "long_strike": lo if kind == "put" else hi,
+                    "kind": kind,
+                }
+                break
+        if entry is None:
+            continue
+        if best is None or create < best[0]:
+            best = (create, entry)
+    return best[1] if best else None
+
+
 def position_value_and_basis(account, entry=None):
     """Return (buyback, credit, legs) for the open SPX trend spread —
     the worker's OWN spread only. Only legs expiring today. A
@@ -693,8 +758,30 @@ def position_value_and_basis(account, entry=None):
                 break
         if chosen is None:
             chosen = spreads[0]
-    else:
+    elif len(spreads) == 1:
         chosen = spreads[0]
+    else:
+        # Multiple spreads and no in-memory entry (e.g. after a
+        # restart): identify the worker's own spread from its entry
+        # order — the earliest filled credit order among the open
+        # spreads, since the worker holds one position at a time and
+        # any spread that appeared later, while its spread was open,
+        # belongs to someone else. This is what keeps the worker from
+        # adopting (and placing a GTC on) a manual spread after a
+        # redeploy.
+        adopted = find_worker_entry_spread(account, spreads)
+        if adopted is None:
+            chosen = spreads[0]
+        else:
+            chosen = None
+            for sp in spreads:
+                strikes = {_leg_kind_strike(l.get("symbol", ""))[1] for l in sp}
+                if (float(adopted["short_strike"]) in strikes
+                        and float(adopted["long_strike"]) in strikes):
+                    chosen = sp
+                    break
+            if chosen is None:
+                chosen = spreads[0]
     symbols = ",".join(p["symbol"] for p in chosen)
     data = api_get("/v1/markets/quotes?symbols=%s&greeks=false" % symbols)
     quotes = data["quotes"]["quote"]
