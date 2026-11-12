@@ -26,20 +26,26 @@ Nasdaq-100 names by market cap, on the paper account only:
   (NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AVGO, META, MU, AMD) qualify
   most days.
 - Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
-- One bid per cycle, at the spread's bid: while a ticker is flat and
-  in the window, the worker evaluates it every poll and places a single
-  debit limit order at the spread's bid (long-leg bids minus short-leg
-  asks, read off the same chains). There is no ceiling anymore —
-  removed Nov 10 at the user's instruction: the bid is the price, full
-  stop — and no walk-up: the price only ever moves once per poll cycle.
-  A bid that does not fill is cancelled next cycle and re-placed at the
-  then-current bid. A bid left working when its pair stops qualifying
-  is cancelled as stale. A fill shows up as a position next poll, and
-  the per-poll check then places the GTC take-profit at 110% of the
-  debit paid. The working bid order is tracked in memory, so after a
-  restart the worker re-adopts it from the orders feed (debit orders
-  carrying its per-ticker tag) instead of being blocked by it until
-  it fills or expires at the close.
+- One bid per cycle, walking up from the spread's bid to its mid:
+  while a ticker is flat and in the window, the worker evaluates it
+  every poll and places a single debit limit order. The first bid is at
+  the spread's bid (long-leg bids minus short-leg asks, read off the
+  same chains). Each cycle the bid goes unfilled, the next bid steps up
+  WALK_STEP (default $0.05) toward the mid-based modeled debit, and it
+  never bids above the mid. There is no ceiling anymore — removed Nov 10
+  at the user's instruction — and the mid is the cap. A bid that does
+  not fill is cancelled next cycle and re-placed at the next walk-up
+  price. A fill resets the walk-up to the bid for the next entry. A bid
+  left working when its pair stops qualifying is cancelled as stale.
+  A fill shows up as a position next poll, and the per-poll check then
+  places the GTC take-profit at 110% of the debit paid. The working bid
+  order is tracked in memory, so after a restart the worker re-adopts
+  it from the orders feed (debit orders carrying its per-ticker tag)
+  instead of being blocked by it until it fills or expires at the
+  close. (Bid-only, no walk-up, was Nov 10-11: 29 bids at $0.79-$1.00
+  never filled, because the AAPL calendar spread is ~$1 wide — bid
+  $0.81, mid $1.32, ask $1.83 — and no seller comes down to the bid.
+  Walk-up added Nov 11 at the user's instruction.)
 - Liquidity gate, two-tier: the SHORT legs (front expiry) must have
   traded at least MIN_LEG_VOLUME contracts today (default 100), and
   the LONG legs (next expiry) at least MIN_LONG_LEG_VOLUME (default
@@ -155,11 +161,16 @@ WALK_START_FRACTION = float(os.environ.get("WALK_START_FRACTION", "0.70"))
 WALK_STEP_FRACTION = float(os.environ.get("WALK_STEP_FRACTION", "0.05"))
 WALK_START_FLOOR = float(os.environ.get("WALK_START_FLOOR", "0.05"))
 WALK_STEP_FLOOR = float(os.environ.get("WALK_STEP_FLOOR", "0.01"))
-# NOTE: MAX_DEBIT_FRACTION, the WALK_* vars and COOLDOWN_SECONDS are
-# retired: the ceiling was removed Nov 10 (the bid is the price) and
-# the walk-up was replaced by one bid per cycle. The vars stay defined
-# so an old Railway env does not break the import, but nothing reads
-# them anymore.
+# Walk-up from the spread bid to its mid (added Nov 11): each cycle an
+# unfilled bid steps up WALK_STEP dollars toward the mid-based modeled
+# debit, never above the mid. Env-tunable.
+WALK_STEP = float(os.environ.get("WALK_STEP", "0.05"))
+# NOTE: MAX_DEBIT_FRACTION, the WALK_*_FRACTION/FLOOR vars and
+# COOLDOWN_SECONDS are retired: the ceiling was removed Nov 10 (the bid
+# is the price) and the old fraction-based walk-up was replaced by one
+# bid per cycle, then by the bid-to-mid walk-up above. The vars stay
+# defined so an old Railway env does not break the import, but nothing
+# reads them anymore.
 HOLD_POLL_SECONDS = int(os.environ.get("HOLD_POLL_SECONDS", "120"))
 SHORT_DTE_MIN = int(os.environ.get("SHORT_DTE_MIN", "5"))
 SHORT_DTE_MAX = int(os.environ.get("SHORT_DTE_MAX", "7"))
@@ -758,14 +769,31 @@ def cleanup_stale_take_profit_orders(account, ticker):
                 "(%s), entry path ignores it" % (order["id"], ticker, exc))
 
 
-def place_bid_order(account, ticker, short_exp, long_exp, put, call, bid):
-    """Place ONE debit limit order at the spread's bid and return its
-    order id (or None when blocked / dry-run). No walk-up: the bid is
-    the price. If it does not fill, the next poll cycle cancels it and
-    re-bids at the then-current bid — the price only ever moves once
-    per cycle, never inside one. Only the worker's own tagged order is
-    ever placed, and place_order enforces at most one pending order
-    per ticker."""
+def walk_up_target(bid, debit, offset, step=WALK_STEP):
+    """Next bid price walking up from the spread bid toward the mid.
+
+    bid is the spread's bid (long-leg bids minus short-leg asks),
+    debit is the mid-based modeled cost (the cap — never bid above
+    the mid), offset is the dollars already walked up. Returns
+    (target, next_offset): the price to bid this cycle and the offset
+    for the next cycle (stepped up by `step`). The offset is relative
+    to the current bid each cycle, so a market move re-bases the
+    walk-up; the cap is applied here, so a widening gap is reached
+    immediately and the price pins at the mid once the offset covers
+    the gap."""
+    target = round(min(bid + offset, debit), 2)
+    return target, round(offset + step, 2)
+
+
+def place_bid_order(account, ticker, short_exp, long_exp, put, call, price):
+    """Place ONE debit limit order at the given walk-up price and return
+    its order id (or None when blocked / dry-run). The caller computes
+    the price: it starts at the spread's bid and steps up WALK_STEP per
+    unfilled cycle, capped at the mid-based modeled debit. If it does
+    not fill, the next poll cycle cancels it and re-bids at the next
+    walk-up price — the price only ever moves once per cycle, never
+    inside one. Only the worker's own tagged order is ever placed, and
+    place_order enforces at most one pending order per ticker."""
     legs = [
         ("sell_to_open", option_symbol(ticker, short_exp, put, "P"), CONTRACTS),
         ("sell_to_open", option_symbol(ticker, short_exp, call, "C"), CONTRACTS),
@@ -773,8 +801,8 @@ def place_bid_order(account, ticker, short_exp, long_exp, put, call, bid):
         ("buy_to_open", option_symbol(ticker, long_exp, call, "C"), CONTRACTS),
     ]
     log("bid: %s %.2f short %s / long %s %dP/%dC"
-        % (ticker, bid, short_exp, long_exp, put, call))
-    resp = place_order(account, ticker, "debit", bid, legs)
+        % (ticker, price, short_exp, long_exp, put, call))
+    resp = place_order(account, ticker, "debit", price, legs)
     if resp.get("blocked"):
         log("bid: %s blocked by an existing pending order, not placed" % ticker)
         return None
@@ -785,7 +813,7 @@ def place_bid_order(account, ticker, short_exp, long_exp, put, call, bid):
     if not order_id:
         log("bid: %s order response without id, not placed: %s" % (ticker, resp))
         return None
-    log("bid: %s order %s working at %.2f" % (ticker, order_id, bid))
+    log("bid: %s order %s working at %.2f" % (ticker, order_id, price))
     return order_id
 
 
@@ -844,9 +872,17 @@ def run_once():
     last_pnl_day = {}
     # Working bid order per ticker: one single-bid attempt per poll
     # cycle. A bid that does not fill is cancelled next cycle and
-    # re-placed at the then-current bid — the price only ever moves
+    # re-placed at the next walk-up price — the price only ever moves
     # once per cycle, never inside one.
     bid_orders = {}
+    # Walk-up offset per ticker: dollars above the spread's bid for the
+    # next bid. Starts at 0 (bid the spread bid), steps up WALK_STEP
+    # after each unfilled bid, and is capped at the mid by the target
+    # computation (min(bid + offset, debit)) so it never bids above the
+    # mid. Reset to 0 on a fill (ticker holding) or when the pair stops
+    # qualifying. Resets on restart; the adopted working bid keeps the
+    # one-pending rule intact either way.
+    walk_offsets = {}
     holding = False
     while True:
         try:
@@ -879,8 +915,9 @@ def run_once():
                     continue
                 holding_tickers.append(ticker)
                 # A position means any earlier bid order for this ticker
-                # has filled; drop its tracking.
+                # has filled; drop its tracking and reset its walk-up.
                 bid_orders.pop(ticker, None)
+                walk_offsets.pop(ticker, None)
                 unrealized = value - basis
                 # Loss exit: close at the mid when the position has lost
                 # half the debit (value at or under STOP_LOSS_FRACTION of
@@ -935,10 +972,11 @@ def run_once():
                 log("heartbeat: flat %d tickers, waiting for window"
                     % len(TICKERS))
             # 2) Entries for flat tickers in the window: one bid per
-            # ticker per cycle, at the spread's bid — no ceiling, no
-            # walk-up. An unfilled bid is cancelled next cycle and
-            # re-placed at the new bid; a bid left working when its
-            # pair stops qualifying is cancelled as stale.
+            # ticker per cycle, walking up from the spread's bid toward
+            # the mid — no ceiling. An unfilled bid is cancelled next
+            # cycle and re-placed at the next walk-up price; a bid left
+            # working when its pair stops qualifying is cancelled as
+            # stale.
             if ENTRY_START <= now.time() < ENTRY_END:
                 # Adopt working bid orders after a restart, so the
                 # cancel-and-rebid flow keeps working (see above).
@@ -964,9 +1002,19 @@ def run_once():
                         if prev_id:
                             if cancel_bid_order(account, ticker, prev_id):
                                 bid_orders.pop(ticker, None)
+                        walk_offsets.pop(ticker, None)
                         skips.append("%s %s" % (ticker, reason))
                         continue
                     short_exp, long_exp, put, call, debit, bid = pair
+                    # Walk up from the spread bid toward the mid
+                    # (debit): first bid at the bid, then +WALK_STEP
+                    # per unfilled cycle, never above the mid. The
+                    # offset is relative to the current bid each cycle,
+                    # so a market move re-bases the walk-up; the cap is
+                    # applied in walk_up_target, not on the stored
+                    # offset, so a widening gap is reached immediately.
+                    offset = walk_offsets.get(ticker, 0.0)
+                    target, next_offset = walk_up_target(bid, debit, offset)
                     if prev_id:
                         if not cancel_bid_order(account, ticker, prev_id):
                             # Still working and the cancel failed: leave
@@ -974,16 +1022,18 @@ def run_once():
                             continue
                         bid_orders.pop(ticker, None)
                     log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
-                        "bid %.2f x %d"
+                        "bid %.2f walk-up %.2f x %d"
                         % (ticker, price, short_exp, long_exp, put, call,
-                           debit, bid, CONTRACTS))
+                           debit, bid, target, CONTRACTS))
                     order_id = place_bid_order(
-                        account, ticker, short_exp, long_exp, put, call, bid)
+                        account, ticker, short_exp, long_exp, put, call, target)
                     if order_id:
                         # A fill shows up as a position next poll; the
                         # per-poll check above then places the GTC
                         # take-profit at 110% of the debit paid.
                         bid_orders[ticker] = order_id
+                        # Next cycle, step up WALK_STEP toward the mid.
+                        walk_offsets[ticker] = next_offset
                 if skips:
                     log("no entry: %s" % ", ".join(skips))
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
