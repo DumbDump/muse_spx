@@ -31,7 +31,7 @@ Nasdaq-100 names by market cap, on the paper account only:
   every poll and places a single debit limit order. The first bid is at
   the spread's bid (long-leg bids minus short-leg asks, read off the
   same chains). Each cycle the bid goes unfilled, the next bid steps up
-  WALK_STEP (default $0.05) toward the mid-based modeled debit, and it
+  WALK_STEP (default $0.10) toward the mid-based modeled debit, and it
   never bids above the mid. There is no ceiling anymore — removed Nov 10
   at the user's instruction — and the mid is the cap. A bid that does
   not fill is cancelled next cycle and re-placed at the next walk-up
