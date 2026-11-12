@@ -26,11 +26,14 @@ Implements one fixed rule set, nothing else:
   and aborts if any SPXW calendar legs expiring after today are held.
   A stale or empty positions read at poll time can never open a second
   calendar, because the gate is re-checked fresh at entry time.
-- Exit at a 10% gain on the debit basis: as soon as an entry fills, the
-  worker places a GTC credit order to close the position at 110% of the
-  debit actually paid, so the exit triggers the moment the market touches
-  it — even between polls or overnight. The poll-based 10% check stays
-  as a fallback for when no take-profit order is working. The standing
+- Exit at a 10% gain on the debit basis, per calendar: as soon as an
+  entry fills, the worker places a GTC credit order to close that
+  calendar at 110% of the debit actually paid, so the exit triggers
+  the moment the market touches it — even between polls or overnight.
+  The poll-based 10% check stays as a fallback for when no
+  take-profit order is working. Exits are always per calendar (4
+  legs), never one combined order across calendars: a combined close
+  is rejected by Tradier (Nov 11: 43 rejections of a 12-leg order). The standing
   order caps the gain at exactly 10%: it will not capture an overshoot
   above the line the way a poll-time close at the mid could. There is no
   end-of-day forced close: a position that never reaches 10% stays open
@@ -385,6 +388,103 @@ def _expiry_from_symbol(symbol):
     return date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6]))
 
 
+def _strike_from_symbol(symbol):
+    """Strike parsed from an option symbol (SPXW261116P07555000 -> 7555).
+    Returns None when no strike parses."""
+    match = re.search(r"(\d{6})([PC])(\d{8})", symbol)
+    if not match:
+        return None
+    return int(match.group(3)) // 1000
+
+
+def group_calendar_legs(legs):
+    """Group open legs into double calendars.
+
+    One calendar = short put + short call (same short expiry) + long put
+    + long call (next expiry, same strikes). Returns a list of
+    ((short_exp, long_exp, put_strike, call_strike), legs) in expiry
+    order. A leg that matches no calendar (e.g. a stray single leg) is
+    returned as its own one-leg group so it is never silently merged
+    into another calendar's close."""
+    today = datetime.now(TZ).date()
+    shorts = [l for l in legs if float(l["quantity"]) < 0]
+    longs = [l for l in legs if float(l["quantity"]) > 0]
+    groups = []
+    used = set()
+    # Calendars are keyed off their short legs. All calendars opened
+    # in one week share the same short expiry, so expiry alone cannot
+    # separate them — pair by strike instead: this worker always sets
+    # strikes $50 each side of SPX, so a calendar's call strike is its
+    # put strike + 100 (7555/7655, 7560/7660, 7575/7675). Each short
+    # put anchors one calendar; its short call is the call at the same
+    # expiry with strike put+100, and its long legs are the same
+    # strikes at the next expiry.
+    short_puts = [l for l in shorts
+                  if re.search(r"\d{6}P\d{8}", l["symbol"])]
+    for sp in short_puts:
+        short_exp = _expiry_from_symbol(sp["symbol"])
+        put = _strike_from_symbol(sp["symbol"])
+        if short_exp is None or put is None:
+            continue
+        call = put + 100
+        sc = next((l for l in shorts
+                   if _expiry_from_symbol(l["symbol"]) == short_exp
+                   and _strike_from_symbol(l["symbol"]) == call
+                   and re.search(r"\d{6}C\d{8}", l["symbol"])), None)
+        if sc is None:
+            continue
+        long_exps = sorted({_expiry_from_symbol(l["symbol"]) for l in longs
+                            if _expiry_from_symbol(l["symbol"]) is not None
+                            and _expiry_from_symbol(l["symbol"]) > short_exp})
+        if not long_exps:
+            continue
+        long_exp = long_exps[0]
+        lp = next((l for l in longs
+                   if _expiry_from_symbol(l["symbol"]) == long_exp
+                   and _strike_from_symbol(l["symbol"]) == put), None)
+        lc = next((l for l in longs
+                   if _expiry_from_symbol(l["symbol"]) == long_exp
+                   and _strike_from_symbol(l["symbol"]) == call), None)
+        if lp is None or lc is None:
+            continue
+        cal = [sp, sc, lp, lc]
+        for l in cal:
+            used.add(l["symbol"])
+        groups.append(((short_exp, long_exp, put, call), cal))
+    for l in legs:
+        if l["symbol"] not in used:
+            groups.append(((None, None, None, None), [l]))
+    return groups
+
+
+def calendar_values(account):
+    """Return one (value, basis, legs) tuple per open calendar, instead
+    of one aggregate across all calendars. Each tuple is the 4 legs of
+    a single double calendar, valued on mids, with its own cost basis.
+    The aggregate position_value_and_basis() is kept for the P&L /
+    heartbeat reporting, which wants the whole-book number."""
+    today = datetime.now(TZ).date()
+    legs = [p for p in get_positions(account)
+            if p["symbol"].startswith("SPXW")
+            and _expiry_from_symbol(p["symbol"]) is not None
+            and _expiry_from_symbol(p["symbol"]) > today]
+    if not legs:
+        return []
+    symbols = ",".join(p["symbol"] for p in legs)
+    data = api_get("/v1/markets/quotes?symbols=%s&greeks=false" % symbols)
+    quotes = data["quotes"]["quote"]
+    if isinstance(quotes, dict):
+        quotes = [quotes]
+    mids = {q["symbol"]: (float(q["bid"]) + float(q["ask"])) / 2.0 for q in quotes}
+    out = []
+    for key, cal_legs in group_calendar_legs(legs):
+        value = sum(float(l["quantity"]) * mids.get(l["symbol"], 0.0) * 100.0
+                    for l in cal_legs)
+        basis = sum(float(l["cost_basis"]) for l in cal_legs)
+        out.append((value, basis, cal_legs))
+    return out
+
+
 def position_value_and_basis(account):
     """Return (net_value, net_basis, legs) for open SPXW legs.
     Only this worker's own double-calendar legs are returned: legs
@@ -486,11 +586,28 @@ def close_position(account, legs):
     absolute value, not a credit order at a negative price — Tradier
     rejects negative prices, which left the Nov 10 SPX position with no
     working order after its stop-loss fired."""
-    value, basis, fresh_legs = position_value_and_basis(account)
+    # Value ONLY the legs passed in: this is one calendar, not the
+    # whole book. The old code re-read every open leg here, so with
+    # three calendars open it built one 12-leg combined close order
+    # and Tradier rejected it 43 times (Nov 11, 10:57 a.m.-1:03 p.m.).
+    # A passed leg that is no longer held means this calendar already
+    # closed (e.g. its take-profit filled just before this poll).
+    symbols = {leg["symbol"] for leg in legs}
+    fresh_legs = [p for p in get_positions(account)
+                  if p["symbol"] in symbols]
     if not fresh_legs:
         log("closing: position already closed, nothing to do")
         return {"already_closed": True}
     legs = fresh_legs
+    data = api_get("/v1/markets/quotes?symbols=%s&greeks=false"
+                   % ",".join(leg["symbol"] for leg in legs))
+    quotes = data["quotes"]["quote"]
+    if isinstance(quotes, dict):
+        quotes = [quotes]
+    mids = {q["symbol"]: (float(q["bid"]) + float(q["ask"])) / 2.0 for q in quotes}
+    value = sum(float(leg["quantity"]) * mids.get(leg["symbol"], 0.0) * 100.0
+                for leg in legs)
+    basis = sum(float(leg["cost_basis"]) for leg in legs)
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     credit = round(value / (contracts * 100.0), 2)
     close_legs = close_legs_for(legs)
@@ -738,41 +855,41 @@ def run_once():
                 flat_state = "waiting for window"
             log(heartbeat_line(now, legs, value, basis, spx_txt, flat_state))
             if legs:
-                unrealized = value - basis
-                # Loss exit: close at the mid when the position has lost
-                # half the debit (value at or under STOP_LOSS_FRACTION of
-                # basis). Poll-based — the GTC slot is held by the
-                # take-profit — so a gap between polls can overshoot it.
-                if basis > 0 and value <= STOP_LOSS_FRACTION * basis:
-                    log("stop-loss hit: value %.2f on basis %.2f" % (value, basis))
-                    close_position(account, legs)
-                    time.sleep(POLL_SECONDS)
-                    continue
-                # Time exit: close when the short leg has 1 day or less
-                # to expiry, so the position never rides through
-                # short-leg expiry and morphs into a naked long straddle.
-                short_exp = short_expiry_from_legs(legs)
-                if short_exp is not None and (short_exp - today).days <= 1:
-                    log("short-leg expiry close: short leg expires %s" % short_exp)
-                    close_position(account, legs)
-                    time.sleep(POLL_SECONDS)
-                    continue
-                # 10% gain exit, any time of day. This is the fallback
-                # for when no take-profit order is working: there is no
-                # end-of-day forced close, so a position that never
-                # reaches 10% stays open (and blocks new entries).
-                if basis > 0 and unrealized >= 0.10 * basis:
-                    log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, basis))
-                    close_position(account, legs)
-                    time.sleep(POLL_SECONDS)
-                    continue
-                # Keep a standing take-profit in place: a GTC credit order
-                # at 110% of basis. This covers restarts and positions
-                # entered before this code shipped; it is silent when an
-                # order is already working. Checked after the closes above
-                # so this poll never places a GTC it is about to cancel.
-                if basis > 0:
-                    place_take_profit(account, legs, basis)
+                # One calendar at a time: each open calendar gets its
+                # own stop / time / 10% exit and its own 4-leg GTC
+                # take-profit at 110% of its own basis. The old code
+                # ran all of this on the aggregate of every open
+                # calendar, which built a single 12-leg combined close
+                # that Tradier rejects — and left the 7555/7560
+                # calendars (Nov 11) with no working take-profit at
+                # all. This loop also heals those: on the first poll
+                # after deploy, each calendar lacking a GTC gets one.
+                for cal_value, cal_basis, cal_legs in calendar_values(account):
+                    unrealized = cal_value - cal_basis
+                    # Loss exit: close at the mid when the calendar has
+                    # lost half its debit (value at or under
+                    # STOP_LOSS_FRACTION of basis).
+                    if cal_basis > 0 and cal_value <= STOP_LOSS_FRACTION * cal_basis:
+                        log("stop-loss hit: value %.2f on basis %.2f" % (cal_value, cal_basis))
+                        close_position(account, cal_legs)
+                        continue
+                    # Time exit: close when the short leg has 1 day or
+                    # less to expiry.
+                    short_exp = short_expiry_from_legs(cal_legs)
+                    if short_exp is not None and (short_exp - today).days <= 1:
+                        log("short-leg expiry close: short leg expires %s" % short_exp)
+                        close_position(account, cal_legs)
+                        continue
+                    # 10% gain exit, any time of day: the fallback for
+                    # when no take-profit order is working.
+                    if cal_basis > 0 and unrealized >= 0.10 * cal_basis:
+                        log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, cal_basis))
+                        close_position(account, cal_legs)
+                        continue
+                    # Keep a standing take-profit in place per
+                    # calendar, silent when one is already working.
+                    if cal_basis > 0:
+                        place_take_profit(account, cal_legs, cal_basis)
             else:
                 # Clean up a stale take-profit first: a credit order left
                 # working after its position closed another way must not
@@ -819,9 +936,9 @@ def run_once():
                             # paid. If the fill has not shown in
                             # positions yet, the per-poll check above
                             # places it on the next poll.
-                            _, fill_basis, fill_legs = position_value_and_basis(account)
-                            if fill_legs and fill_basis > 0:
-                                place_take_profit(account, fill_legs, fill_basis)
+                            for _, fill_basis, fill_legs in calendar_values(account):
+                                if fill_legs and fill_basis > 0:
+                                    place_take_profit(account, fill_legs, fill_basis)
                         else:
                             next_cycle_time = datetime.now(TZ) + timedelta(minutes=5)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
