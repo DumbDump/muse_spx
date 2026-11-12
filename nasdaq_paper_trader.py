@@ -163,8 +163,9 @@ WALK_START_FLOOR = float(os.environ.get("WALK_START_FLOOR", "0.05"))
 WALK_STEP_FLOOR = float(os.environ.get("WALK_STEP_FLOOR", "0.01"))
 # Walk-up from the spread bid to its mid (added Nov 11): each cycle an
 # unfilled bid steps up WALK_STEP dollars toward the mid-based modeled
-# debit, never above the mid. Env-tunable.
-WALK_STEP = float(os.environ.get("WALK_STEP", "0.05"))
+# debit, never above the mid. Env-tunable. Step raised to $0.10 Nov 11
+# at the user's instruction ("Go increments of 10 cents").
+WALK_STEP = float(os.environ.get("WALK_STEP", "0.10"))
 # NOTE: MAX_DEBIT_FRACTION, the WALK_*_FRACTION/FLOOR vars and
 # COOLDOWN_SECONDS are retired: the ceiling was removed Nov 10 (the bid
 # is the price) and the old fraction-based walk-up was replaced by one
