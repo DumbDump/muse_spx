@@ -29,6 +29,12 @@ Implements one fixed rule set, nothing else. It mirrors the SPX worker
   (60 seconds by default) so the 10% exit fires close to the line;
   while flat it polls every POLL_SECONDS (3 minutes).
 - 10 contracts per trade, one position at a time.
+- Leg-collision avoidance: before starting a walk-up cycle, the worker
+  reads every open QQQ position in the account. If either of the
+  calendar's strikes (put or call) is already held by another
+  strategy, the pair is skipped and retried next poll — the strikes
+  move with QQQ, so a later poll offers clear strikes. This keeps the
+  worker from doubling up on a leg another lane already holds.
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
   worker places a GTC credit order to close the position at 110% of the
   debit actually paid, so the exit triggers the moment the market touches
@@ -556,6 +562,34 @@ def cleanup_stale_take_profit_orders(account):
                 "entry path ignores it" % (order["id"], exc))
 
 
+def _strike_from_symbol(symbol):
+    """Strike parsed from a QQQ option symbol (QQQ261116P00676000 -> 676).
+    Returns None when no strike parses."""
+    match = re.search(r"(\d{6})([PC])(\d{8})", symbol)
+    if not match:
+        return None
+    return int(match.group(3)) // 1000
+
+
+def held_qqq_strikes(account):
+    """Strikes currently held in any open QQQ position in the paper
+    account, whatever lane opened them. Used to avoid opening a
+    calendar on a strike another strategy already holds. Returns a
+    set of strike prices."""
+    strikes = set()
+    try:
+        for p in get_positions(account):
+            sym = str(p.get("symbol", ""))
+            if not sym.startswith("QQQ"):
+                continue
+            strike = _strike_from_symbol(sym)
+            if strike is not None:
+                strikes.add(float(strike))
+    except Exception as exc:  # noqa: BLE001 - a failed read is not "no strikes held"
+        log("held-strikes read failed (%s), treating as no strikes held" % exc)
+    return strikes
+
+
 def run_walkup_cycle(account, short_exp, long_exp, put, call, modeled_debit):
     """Bid a pair from max(WALK_START, modeled debit - WALK_START_OFFSET)
     up to MAX_DEBIT in WALK_STEP steps.
@@ -753,6 +787,21 @@ def run_once():
                                 % (MAX_DEBIT, qqq))
                     else:
                         short_exp, long_exp, put, call, debit = pair
+                        # Leg-collision avoidance: if either of this
+                        # calendar's strikes is already held in an open
+                        # QQQ position (any lane), skip this pair and
+                        # retry next poll. The strikes move with QQQ,
+                        # so a later poll will offer clear strikes.
+                        held = held_qqq_strikes(account)
+                        if float(put) in held or float(call) in held:
+                            log("entry: skipping pair %dP/%dC, strike%s held "
+                                "(QQQ %.2f), will retry next poll"
+                                % (put, call,
+                                   "s" if (float(put) in held
+                                           and float(call) in held) else "",
+                                   qqq))
+                            time.sleep(HOLD_POLL_SECONDS if holding else POLL_SECONDS)
+                            continue
                         log("entry: QQQ %.2f short %s / long %s %dP/%dC modeled debit %.2f x %d"
                             % (qqq, short_exp, long_exp, put, call, debit, CONTRACTS))
                         filled = run_walkup_cycle(account, short_exp, long_exp, put, call, debit)

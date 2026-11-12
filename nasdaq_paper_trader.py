@@ -54,6 +54,13 @@ Nasdaq-100 names by market cap, on the paper account only:
   floor on all four legs would block liquid names outright. The skip
   line reports "low-volume" when a candidate fails the gate.
 - 1 contract per trade (CONTRACTS).
+- Leg-collision avoidance: before bidding for a ticker, the worker
+  reads every open position for that ticker in the account. If either
+  of the calendar's strikes (put or call) is already held by another
+  strategy, the ticker is skipped this cycle and any working bid is
+  cancelled — the strikes move with the price, so a later cycle offers
+  clear strikes. This keeps the worker from doubling up on a leg
+  another lane already holds.
 - Exit at a 10% gain on the debit basis: as soon as an entry fills, the
   worker places a GTC credit order to close the position at 110% of the
   debit actually paid, so the exit triggers the moment the market touches
@@ -200,6 +207,31 @@ def root_of(symbol):
     """Underlying root of an option symbol (NVDA261116P00187000 -> NVDA)."""
     match = re.match(r"^([A-Z]+)\d{6}[PC]\d{8}$", symbol)
     return match.group(1) if match else None
+
+
+def _strike_from_symbol(symbol):
+    """Strike parsed from an option symbol (AAPL261116P00347500 -> 347.5).
+    Returns None when no strike parses."""
+    match = re.search(r"(\d{6})([PC])(\d{8})", symbol)
+    if not match:
+        return None
+    return int(match.group(3)) / 1000.0
+
+
+def held_strikes_for_ticker(all_positions, ticker):
+    """Strikes currently held in any open position for this ticker,
+    whatever lane opened them. Used to avoid opening a calendar on a
+    strike another strategy already holds. Returns a set of strike
+    prices."""
+    strikes = set()
+    for p in all_positions:
+        sym = str(p.get("symbol", ""))
+        if root_of(sym) != ticker:
+            continue
+        strike = _strike_from_symbol(sym)
+        if strike is not None:
+            strikes.add(float(strike))
+    return strikes
 
 
 def api_get(path):
@@ -1007,6 +1039,20 @@ def run_once():
                         skips.append("%s %s" % (ticker, reason))
                         continue
                     short_exp, long_exp, put, call, debit, bid = pair
+                    # Leg-collision avoidance: if either of this
+                    # calendar's strikes is already held in an open
+                    # position for this ticker (any lane), skip this
+                    # ticker this cycle and cancel any working bid.
+                    # The strikes move with the price, so a later cycle
+                    # will offer clear strikes.
+                    held = held_strikes_for_ticker(all_positions, ticker)
+                    if float(put) in held or float(call) in held:
+                        if prev_id:
+                            if cancel_bid_order(account, ticker, prev_id):
+                                bid_orders.pop(ticker, None)
+                        walk_offsets.pop(ticker, None)
+                        skips.append("%s strikes-held" % ticker)
+                        continue
                     # Walk up from the spread bid toward the mid
                     # (debit): first bid at the bid, then +WALK_STEP
                     # per unfilled cycle, never above the mid. The

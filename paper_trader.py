@@ -26,6 +26,13 @@ Implements one fixed rule set, nothing else:
   and aborts if any SPXW calendar legs expiring after today are held.
   A stale or empty positions read at poll time can never open a second
   calendar, because the gate is re-checked fresh at entry time.
+- Leg-collision avoidance: before starting a walk-up cycle, the worker
+  reads every open SPXW position in the account. If either of the
+  calendar's strikes (put or call) is already held by another
+  strategy (e.g. the trend worker's 0DTE spread), the pair is skipped
+  and retried next poll — the strikes move with SPX, so a later poll
+  offers clear strikes. This keeps the worker from doubling up on a
+  leg another lane already holds.
 - Exit at a 10% gain on the debit basis, per calendar: as soon as an
   entry fills, the worker places a GTC credit order to close that
   calendar at 110% of the debit actually paid, so the exit triggers
@@ -697,6 +704,25 @@ def cleanup_stale_take_profit_orders(account):
                 "entry path ignores it" % (order["id"], exc))
 
 
+def held_spxw_strikes(account):
+    """Strikes currently held in any open SPXW position in the paper
+    account, whatever lane opened them. Used to avoid opening a
+    calendar on a strike another strategy already holds (e.g. the
+    trend worker's 0DTE spread). Returns a set of strike prices."""
+    strikes = set()
+    try:
+        for p in get_positions(account):
+            sym = str(p.get("symbol", ""))
+            if not sym.startswith("SPXW"):
+                continue
+            strike = _strike_from_symbol(sym)
+            if strike is not None:
+                strikes.add(float(strike))
+    except Exception as exc:  # noqa: BLE001 - a failed read is not "no strikes held"
+        log("held-strikes read failed (%s), treating as no strikes held" % exc)
+    return strikes
+
+
 def has_open_calendar(account):
     """True when the paper account holds any open SPXW calendar legs
     expiring after today — i.e. this worker already has a position.
@@ -918,6 +944,22 @@ def run_once():
                                 % (MAX_DEBIT, spx))
                     else:
                         short_exp, long_exp, put, call, debit = pair
+                        # Leg-collision avoidance: if either of this
+                        # calendar's strikes is already held in an open
+                        # SPXW position (any lane — e.g. the trend
+                        # worker's 0DTE spread), skip this pair and
+                        # retry next poll. The strikes move with SPX,
+                        # so a later poll will offer clear strikes.
+                        held = held_spxw_strikes(account)
+                        if float(put) in held or float(call) in held:
+                            log("entry: skipping pair %dP/%dC, strike%s held "
+                                "(SPX %.2f), will retry next poll"
+                                % (put, call,
+                                   "s" if (float(put) in held
+                                           and float(call) in held) else "",
+                                   spx))
+                            time.sleep(POLL_SECONDS)
+                            continue
                         # Hard one-position gate, checked fresh right
                         # before the cycle: the poll-start positions read
                         # may be stale, so never start a walk-up on its
