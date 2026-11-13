@@ -57,6 +57,14 @@ to the paper worker.
   exit) cancels the working GTC first, and a new GTC is placed when
   the next position opens — so a close at the max-loss stop always
   clears the old GTC and the next entry gets a fresh one.
+- Aged target: if a position has been open more than TARGET_AGE_MINUTES
+  (30) and is in profit but has not reached the 50% take-profit, the
+  target is lowered to 25% profit (buy back at 75% of the credit,
+  AGED_TARGET_FRACTION): the working GTC is cancelled and re-placed
+  at the lower target, and the poll fallback uses the lowered target
+  too. A position at a loss is never lowered — the 2x stop still
+  governs it. The 30-minute clock starts when the position is first
+  seen open (and restarts on a worker restart).
 - HARD EXIT: every position is closed at 12:55 p.m. PT (3:55 p.m. ET),
   5 minutes before the 4:00 p.m. ET market close, whatever its P&L.
   The check runs every poll, so a failed close is retried until it
@@ -138,6 +146,8 @@ ENTRY_END = dtime(12, 0)
 HARD_EXIT = dtime(12, 55)
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 PROFIT_TARGET_FRACTION = float(os.environ.get("PROFIT_TARGET_FRACTION", "0.50"))
+TARGET_AGE_MINUTES = float(os.environ.get("TARGET_AGE_MINUTES", "30"))
+AGED_TARGET_FRACTION = float(os.environ.get("AGED_TARGET_FRACTION", "0.75"))
 STOP_MULTIPLE = float(os.environ.get("STOP_MULTIPLE", "2.0"))
 MIN_CREDIT = float(os.environ.get("MIN_CREDIT", "1.00"))
 MAX_CREDIT = float(os.environ.get("MAX_CREDIT", "2.50"))
@@ -832,15 +842,30 @@ def find_gtc_for_legs(account, close_legs):
     return None
 
 
-def place_gtc_take_profit(account, legs, credit):
+def aged_target_applies(now, position_opened_at, buyback, credit):
+    """True when a position open longer than TARGET_AGE_MINUTES is in
+    profit but has not reached the 50% take-profit: the target should
+    be lowered to 25% profit (buy back at AGED_TARGET_FRACTION of the
+    credit). A position at a loss, at breakeven, or already at/below
+    the 50% target never qualifies."""
+    if position_opened_at is None or credit <= 0:
+        return False
+    age_seconds = (now - position_opened_at).total_seconds()
+    return (age_seconds >= TARGET_AGE_MINUTES * 60
+            and buyback < credit
+            and buyback > PROFIT_TARGET_FRACTION * credit)
+
+
+def place_gtc_take_profit(account, legs, credit, target_fraction=PROFIT_TARGET_FRACTION):
     """Place the standing GTC take-profit for an open spread: a debit
-    order to buy it back at 50% of the credit received. Returns the
+    order to buy it back at target_fraction of the credit received
+    (50% normally, 75% once the aged target applies). Returns the
     order id, or None when skipped (a GTC is already working for
     these legs, or the placement is blocked)."""
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     if credit <= 0 or contracts <= 0:
         return None
-    price = round(PROFIT_TARGET_FRACTION * credit / (contracts * 100.0), 2)
+    price = round(target_fraction * credit / (contracts * 100.0), 2)
     price = max(price, 0.01)
     close_legs = close_legs_for(legs)
     existing = find_gtc_for_legs(account, close_legs)
@@ -852,8 +877,8 @@ def place_gtc_take_profit(account, legs, credit):
     if resp.get("blocked") or resp.get("dry_run"):
         return None
     order = resp.get("order", resp)
-    log("GTC take-profit placed id=%s buyback %.2f (50%% of credit %.2f)"
-        % (order.get("id"), price, credit))
+    log("GTC take-profit placed id=%s buyback %.2f (%.0f%% of credit %.2f)"
+        % (order.get("id"), price, target_fraction * 100, credit))
     return order.get("id")
 
 
@@ -934,6 +959,10 @@ def run_once():
     # keep identifying THIS spread — not a manual spread that may also
     # be open in the same account. Cleared when flat.
     open_spread = None
+    # Aged-target clock: when the current position was first seen open,
+    # and whether its take-profit has already been lowered to 25%.
+    position_opened_at = None
+    target_lowered = False
     # Stale-GTC cleanup runs once per process run (best effort).
     gtc_cleanup_done = False
     # Daily round-trip cap: completed round-trips (one entry + its
@@ -987,6 +1016,11 @@ def run_once():
                     % (round_trips_today, MAX_ROUND_TRIPS_PER_DAY))
             had_position = bool(legs)
             if legs:
+                if position_opened_at is None:
+                    # First poll with this position open: start the
+                    # aged-target clock.
+                    position_opened_at = now
+                    target_lowered = False
                 # A position means any earlier entry order has filled;
                 # cancel a leftover working entry so it cannot open a
                 # second position after this one closes. Remember which
@@ -1022,6 +1056,30 @@ def run_once():
                                 "kind": kind,
                             }
                             break
+                # Aged target: open more than TARGET_AGE_MINUTES, in
+                # profit, but the 50% target not yet hit — lower the
+                # target to 25% profit so the trade closes instead of
+                # sitting. The old 50% GTC is cancelled first; the 75%
+                # GTC is placed below. A refused cancel retries next
+                # poll (target_lowered stays False).
+                if aged_target_applies(now, position_opened_at, buyback, credit) \
+                        and not target_lowered:
+                    lowered = True
+                    if working_gtc is not None:
+                        try:
+                            cancel_order(account, working_gtc)
+                            log("aged target: cancelled old GTC %s" % working_gtc)
+                            working_gtc = None
+                        except Exception as exc:  # noqa: BLE001 - retry next poll
+                            log("aged target: cancel of GTC %s failed (%s), will retry"
+                                % (working_gtc, exc))
+                            lowered = False
+                    if lowered:
+                        target_lowered = True
+                        log("aged target: open %.0f min, in profit (buyback %.2f on credit %.2f), "
+                            "lowering take-profit to 25%% (buyback %.2f)"
+                            % ((now - position_opened_at).total_seconds() / 60.0,
+                               buyback, credit, AGED_TARGET_FRACTION * credit))
                 # Standing GTC take-profit: place one (buy back at 50%
                 # of the credit) when a position opens. Adopt the
                 # working one after a restart instead of duplicating it.
@@ -1036,7 +1094,10 @@ def run_once():
                             % working_gtc)
                         working_gtc = None
                 if working_gtc is None:
-                    working_gtc = place_gtc_take_profit(account, legs, credit)
+                    working_gtc = place_gtc_take_profit(
+                        account, legs, credit,
+                        AGED_TARGET_FRACTION if target_lowered
+                        else PROFIT_TARGET_FRACTION)
                 # HARD EXIT: 12:55 p.m. PT, 5 minutes before the close.
                 # Closes whatever is open, at the mid, whatever its P&L.
                 # The close cancels the working GTC first.
@@ -1047,10 +1108,14 @@ def run_once():
                     working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
-                # Profit target: buy back at 50% of the credit received.
-                # The GTC normally closes this first; the poll is the
-                # fallback if the GTC has not filled.
-                if credit > 0 and buyback <= PROFIT_TARGET_FRACTION * credit:
+                # Profit target: buy back at the effective target
+                # fraction of the credit received (50% normally, 25%
+                # once the aged target applies). The GTC normally
+                # closes this first; the poll is the fallback if the
+                # GTC has not filled.
+                effective_target = (AGED_TARGET_FRACTION if target_lowered
+                                    else PROFIT_TARGET_FRACTION)
+                if credit > 0 and buyback <= effective_target * credit:
                     log("profit target hit: buyback %.2f on credit %.2f"
                         % (buyback, credit))
                     close_position(account, legs, "50% profit target",
@@ -1077,6 +1142,8 @@ def run_once():
                 # spread identity too, so the next position is
                 # identified fresh.
                 open_spread = None
+                position_opened_at = None
+                target_lowered = False
                 if working_gtc is not None:
                     working_gtc = None
                 # Best-effort stale-GTC cleanup once per run: a working
