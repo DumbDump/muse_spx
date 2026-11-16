@@ -8,7 +8,8 @@ Implements one fixed rule set, nothing else:
   live account.
 - SPX 0DTE (same-day expiry) vertical credit spreads, direction from the
   trend: bullish -> bull put spread, bearish -> bear call spread.
-- Trend is the 9/21 EMA crossover on 15-minute SPX bars, seeded from the
+- Trend is the 9/21 EMA crossover on BOTH the 15-minute and 5-minute
+  SPX bars: an entry needs both timeframes to agree, seeded from the
   prior sessions' bars so it is valid from the open. (VWAP is NOT used:
   SPX is an index and Tradier's timesales returns volume 0 for it, so a
   volume-weighted average cannot be computed from this feed.)
@@ -259,18 +260,19 @@ def chain_mid(opt):
     return (float(opt["bid"]) + float(opt["ask"])) / 2.0
 
 
-def get_bars_15m():
-    """Return the closes of 15-minute SPX bars, chronological, regular
-    session only (09:30-16:00 ET). Fetches the last 4 calendar days so
-    the EMA is seeded even on a Monday (prior Friday's bars). Timesales
-    times are ET; volume is 0 for the index, so only closes are used.
-    Returns [] when the endpoint gives nothing usable."""
+def get_bars(interval):
+    """Return the closes of SPX bars at the given timesales interval
+    ("15min" or "5min"), chronological, regular session only
+    (09:30-16:00 ET). Fetches the last 4 calendar days so the EMA is
+    seeded even on a Monday (prior Friday's bars). Timesales times are
+    ET; volume is 0 for the index, so only closes are used. Returns []
+    when the endpoint gives nothing usable."""
     today = datetime.now(TZ).date()
     start = today - timedelta(days=4)
     try:
         data = api_get(
-            "/v1/markets/timesales?symbol=SPX&interval=15min&start=%s&end=%s&session_filter=all"
-            % (start.isoformat(), today.isoformat())
+            "/v1/markets/timesales?symbol=SPX&interval=%s&start=%s&end=%s&session_filter=all"
+            % (interval, start.isoformat(), today.isoformat())
         )
     except Exception as exc:  # noqa: BLE001 - no bars, no trend
         log("timesales failed (%s), no trend this poll" % exc)
@@ -295,6 +297,16 @@ def get_bars_15m():
     return closes
 
 
+def get_bars_15m():
+    """15-minute SPX closes; see get_bars()."""
+    return get_bars("15min")
+
+
+def get_bars_5m():
+    """5-minute SPX closes; see get_bars()."""
+    return get_bars("5min")
+
+
 def ema(values, period):
     """EMA series, seeded with the SMA of the first `period` values.
     Returns [] when there are not enough values."""
@@ -307,15 +319,14 @@ def ema(values, period):
     return out
 
 
-def trend_direction():
-    """'bull' when the fast EMA is above the slow EMA on 15-min bars,
-    'bear' when below, None when there is no clear read (too few bars
-    or the two are equal). The EMAs are seeded from prior sessions, so
-    the read is valid from the open."""
-    closes = get_bars_15m()
+def _ema_direction(closes, label):
+    """'bull'/'bear' from the 9/21 EMA crossover on the given closes,
+    or (None, fast, slow) when there is no clear read (too few bars
+    or the two EMAs are equal). Logs the insufficient-bars case for
+    the named timeframe."""
     if len(closes) < EMA_SLOW:
-        log("trend: only %d 15-min bars, need %d — no trend"
-            % (len(closes), EMA_SLOW))
+        log("trend: only %d %s bars, need %d — no trend"
+            % (len(closes), label, EMA_SLOW))
         return None, None, None
     fast = ema(closes, EMA_FAST)
     slow = ema(closes, EMA_SLOW)
@@ -327,6 +338,25 @@ def trend_direction():
     if f < s:
         return "bear", f, s
     return None, f, s
+
+
+def trend_direction():
+    """'bull' only when the 9/21 EMA crossover is bullish on BOTH the
+    15-min and the 5-min SPX bars, 'bear' only when both are bearish.
+    If the two timeframes disagree, or either has too few bars, there
+    is no trend and no entry is placed that poll. The EMAs are seeded
+    from prior sessions, so the read is valid from the open. Returns
+    (direction, 15-min fast EMA, 15-min slow EMA)."""
+    dir15, f15, s15 = _ema_direction(get_bars_15m(), "15-min")
+    if dir15 is None:
+        return None, f15, s15
+    dir5, f5, s5 = _ema_direction(get_bars_5m(), "5-min")
+    if dir5 is None:
+        return None, f15, s15
+    if dir15 != dir5:
+        log("trend: 15m %s / 5m %s — no entry" % (dir15, dir5))
+        return None, f15, s15
+    return dir15, f15, s15
 
 
 def held_spxw_strikes(account):
