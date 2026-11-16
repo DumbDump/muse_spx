@@ -42,7 +42,10 @@ to the paper worker.
   the open position is held until an exit fires.
 - DAILY CAP: at most MAX_ROUND_TRIPS_PER_DAY completed round-trips
   per calendar day (default 2). A round-trip is one entry plus its
-  close (profit target, stop, hard exit, or GTC fill). Once the cap
+  close (profit target, stop, hard exit, or GTC fill) of the
+  worker's OWN spread only — other positions vanishing (an iron
+  condor expiring, a manual spread closing) do not count, and a
+  single empty positions read cannot count either. Once the cap
   is reached, no new entries are placed for the rest of the day; the
   worker keeps polling and managing any open position. The count
   resets at midnight PT. It is tracked in memory and reset on
@@ -934,6 +937,77 @@ def heartbeat_line(now, legs, buyback, credit, spx_txt, flat_state):
     return "heartbeat: flat SPX %s %s" % (spx_txt, flat_state)
 
 
+def _legs_are_own_spread(legs, open_spread):
+    """True when `legs` are exactly the worker's tracked spread: two
+    legs, same kind, $5 apart, strikes matching open_spread. Anything
+    else — unpaired condor legs (the fallback 'all legs' read),
+    another spread, a single leg — is not the worker's spread."""
+    if not legs or len(legs) != 2 or open_spread is None:
+        return False
+    try:
+        short = float(open_spread["short_strike"])
+        long = float(open_spread["long_strike"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if abs(short - long) != SPREAD_WIDTH:
+        return False
+    kind = open_spread.get("kind")
+    strikes = set()
+    for leg in legs:
+        leg_kind, strike = _leg_kind_strike(leg.get("symbol", ""))
+        if strike is None or (kind is not None and leg_kind != kind):
+            return False
+        strikes.add(strike)
+    return strikes == {short, long}
+
+
+class RoundTripCounter:
+    """Count completed round-trips for the daily cap — the worker's
+    OWN $5-wide vertical spreads only.
+
+    The old code counted ANY open -> flat transition of whatever
+    position_value_and_basis() returned. That misfired twice on
+    2026-11-16: the Nov 16 iron condors closing pre-market counted
+    (their unpaired legs fall back to 'all legs', so they read as a
+    position), and a transient empty positions read counted too —
+    3/3 by 07:36 PT on 1 real round-trip, sidelining the worker
+    until a manual restart. Two guards now apply: (1) a poll only
+    counts as 'holding' when the legs are exactly the tracked
+    spread — condor legs and other spreads never arm the counter.
+    (2) a round-trip completes only after 2 consecutive polls with
+    the own spread gone, so one empty read cannot count. Adopted
+    spreads still count once adopted (their open_spread is set),
+    matching the Nov 12 behaviour where an adopted manual close
+    used a round-trip. Undercounting stays possible (a spread that
+    opens and closes within one poll, or a close while the worker
+    is down) — the safe direction for a cap.
+    """
+
+    def __init__(self):
+        self.holding_own = False
+        self.flat_polls = 0
+
+    def reset(self):
+        self.holding_own = False
+        self.flat_polls = 0
+
+    def poll(self, legs, open_spread):
+        """Feed one poll's legs + tracked spread. Returns True when a
+        round-trip just completed."""
+        if _legs_are_own_spread(legs, open_spread):
+            self.holding_own = True
+            self.flat_polls = 0
+            return False
+        if not self.holding_own:
+            return False
+        self.flat_polls += 1
+        if self.flat_polls < 2:
+            return False
+        self.holding_own = False
+        self.flat_polls = 0
+        return True
+
+
 def run_once():
     if not API_KEY:
         log("TRADIER_API_KEY is not set, exiting")
@@ -966,12 +1040,12 @@ def run_once():
     # Stale-GTC cleanup runs once per process run (best effort).
     gtc_cleanup_done = False
     # Daily round-trip cap: completed round-trips (one entry + its
-    # close) per calendar day. Counted in memory from position
-    # transitions (open -> flat); reset at midnight PT and on restart
-    # the count restarts at 0 (see docstring).
+    # close) per calendar day. Counted in memory by RoundTripCounter
+    # from the worker's OWN spread only; reset at midnight PT and on
+    # restart the count restarts at 0 (see docstring).
     round_trips_today = 0
     round_trips_date = None
-    had_position = False
+    rt_counter = RoundTripCounter()
     while True:
         try:
             now = datetime.now(TZ)
@@ -1001,20 +1075,22 @@ def run_once():
             else:
                 flat_state = "waiting for window"
             log(heartbeat_line(now, legs, buyback, credit, spx_txt, flat_state))
-            # Daily round-trip cap bookkeeping: reset at midnight PT;
-            # a transition from holding a position to flat means one
-            # round-trip completed (entry + close, by any exit path
-            # including a GTC fill).
+            # Daily round-trip cap bookkeeping: reset at midnight PT.
+            # A round-trip completes only when the worker's OWN spread
+            # (tracked in open_spread) goes away for 2 polls running
+            # — see RoundTripCounter. Other positions vanishing (an
+            # iron condor expiring, a manual spread closing) and a
+            # single empty positions read do not count.
             if round_trips_date != today:
                 round_trips_today = 0
                 round_trips_date = today
+                rt_counter.reset()
                 log("round-trip count reset for %s (cap %d/day)"
                     % (today.isoformat(), MAX_ROUND_TRIPS_PER_DAY))
-            if had_position and not legs:
+            if rt_counter.poll(legs, open_spread):
                 round_trips_today += 1
                 log("round-trip %d/%d completed today"
                     % (round_trips_today, MAX_ROUND_TRIPS_PER_DAY))
-            had_position = bool(legs)
             if legs:
                 if position_opened_at is None:
                     # First poll with this position open: start the
