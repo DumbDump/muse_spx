@@ -653,6 +653,60 @@ def cancel_order(account, order_id):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def cancel_confirmed(account, order_id):
+    """Attempt to cancel order_id. Return True only when the order is
+    confirmed gone: the DELETE succeeded, or the order is no longer
+    listed among pending orders (it filled or was cancelled on its
+    own). Return False when the cancel was refused AND the order is
+    still pending — the caller must keep tracking it and must NOT
+    place a replacement order, or the old order can fill alongside
+    the new one and open a second position. That is the duplicate
+    entry that left the 7325/7330 bear call unmanaged on Nov 17, 2026:
+    the old cancel was swallowed as "ignoring" and the worker forgot
+    the order while it was still working."""
+    try:
+        cancel_order(account, order_id)
+        return True
+    except Exception as exc:  # noqa: BLE001 - check the feed, do not assume
+        log("cancel of order %s refused (%s), checking if still pending"
+            % (order_id, exc))
+    try:
+        for order in get_pending_orders(account):
+            if str(order.get("id")) == str(order_id):
+                return False
+    except Exception as exc:  # noqa: BLE001 - cannot confirm, stay safe
+        log("cancel check for order %s failed (%s), assuming still pending"
+            % (order_id, exc))
+        return False
+    return True
+
+
+def has_pending_credit_entry(account):
+    """(True, order_id) when any pending CREDIT order has 0DTE SPXW
+    legs — an entry order, the worker's own or a manual one. The
+    worker holds one position at a time, so no new entry is placed
+    while a credit order is working. This covers a restart, where the
+    in-memory working entry is lost but the pre-restart entry order is
+    still working. GTC take-profits and closes are debit orders and
+    never block here. A failed pending-orders read is treated as
+    blocking: a new entry must not be placed on an unread feed."""
+    today = datetime.now(TZ).date()
+    try:
+        pending = get_pending_orders(account)
+    except Exception as exc:  # noqa: BLE001 - stay safe, skip the entry
+        log("pending credit-entry check failed (%s), entry skipped this poll"
+            % exc)
+        return True, None
+    for order in pending:
+        if order.get("type") != "credit":
+            continue
+        for sym in order.get("symbols", set()):
+            if (str(sym).startswith("SPXW")
+                    and _expiry_from_symbol(str(sym)) == today):
+                return True, order.get("id")
+    return False, None
+
+
 def close_legs_for(legs):
     """Closing legs for open legs: buy back shorts, sell longs."""
     out = []
@@ -950,6 +1004,14 @@ def run_once():
     # when a position opens. Cancelled on any close; a new one is placed
     # when the next position opens.
     working_gtc = None
+    # Every entry order this run placed, in order. Normally the tracked
+    # spread is the only one open; if a duplicate entry ever fills, the
+    # second spread is in this list too, so the backstop below can find
+    # it and manage it instead of leaving it unmanaged with no GTC.
+    own_entries = []
+    # GTC take-profit ids for open own spreads other than the tracked
+    # one, keyed by (short_strike, long_strike, kind).
+    orphan_gtcs = {}
     # The spread the worker is currently managing (the entry dict for
     # the open position). Kept while a position is open so later polls
     # keep identifying THIS spread — not a manual spread that may also
@@ -979,6 +1041,26 @@ def run_once():
                 if now.hour == hour and last_pnl_day.get(hour) != today:
                     pnl_snapshot(account, open_spread)
                     last_pnl_day[hour] = today
+            # A duplicate entry can leave a second own spread open that
+            # the tracked spread never sees. If the tracked spread is
+            # gone but an entry this run placed still has an open
+            # position, manage that spread instead of going flat and
+            # placing a new entry on top of it. Entries whose spreads
+            # are gone are dropped, so this list stays tiny.
+            if open_spread is None:
+                _kept = []
+                for _entry in list(own_entries):
+                    if _entry is working_entry:
+                        _kept.append(_entry)
+                        continue
+                    _b, _c, _lgs = position_value_and_basis(account, entry=_entry)
+                    if _lgs:
+                        _kept.append(_entry)
+                        if open_spread is None:
+                            open_spread = _entry
+                            log("managing untracked own spread %s/%s (duplicate entry)"
+                                % (_entry["short_strike"], _entry["long_strike"]))
+                own_entries = _kept
             buyback, credit, legs = position_value_and_basis(
                 account, entry=open_spread or working_entry)
             # Heartbeat every poll: one short line so the log always shows
@@ -1023,14 +1105,16 @@ def run_once():
                 if working_entry is not None:
                     if open_spread is None:
                         open_spread = working_entry
-                    try:
-                        cancel_order(account, working_entry["id"])
+                    if cancel_confirmed(account, working_entry["id"]):
                         log("entry order %s cancelled after fill"
                             % working_entry["id"])
-                    except Exception as exc:  # noqa: BLE001 - best effort
-                        log("entry order %s cancel failed (%s), ignoring"
-                            % (working_entry["id"], exc))
-                    working_entry = None
+                        working_entry = None
+                    else:
+                        # Still working: keep tracking it so it is
+                        # cancelled on a later poll. Forgetting it
+                        # here is what let a duplicate entry fill.
+                        log("entry order %s still working after fill, keeping it tracked"
+                            % working_entry["id"])
                 # Standing GTC take-profit: place one (buy back at 50%
                 # of the credit) when a position opens. The tracked
                 # GTC is verified by order id each poll: a GTC
@@ -1044,6 +1128,43 @@ def run_once():
                     working_gtc = None
                 if working_gtc is None:
                     working_gtc = place_gtc_take_profit(account, legs, credit)
+                # Backstop: any OTHER open own spread (a duplicate entry
+                # filled alongside the tracked one) gets the same
+                # treatment — a standing GTC, the 50% profit target,
+                # and the hard exit — so no own spread is ever
+                # unmanaged with no GTC. Only spreads matching an
+                # entry this run placed are touched; a manual spread
+                # is never adopted.
+                for _entry in list(own_entries):
+                    if (open_spread is not None
+                            and _entry["short_strike"] == open_spread["short_strike"]
+                            and _entry["long_strike"] == open_spread["long_strike"]
+                            and _entry.get("kind") == open_spread.get("kind")):
+                        continue
+                    _b, _c, _legs = position_value_and_basis(account, entry=_entry)
+                    if not _legs:
+                        continue
+                    _key = (_entry["short_strike"], _entry["long_strike"], _entry["kind"])
+                    _gtc = orphan_gtcs.get(_key)
+                    if _gtc is not None and not gtc_order_working(account, _gtc):
+                        log("orphan GTC %s no longer working, will re-place" % _gtc)
+                        _gtc = None
+                    if _gtc is None:
+                        _gtc = place_gtc_take_profit(account, _legs, _c)
+                        orphan_gtcs[_key] = _gtc
+                    if _c > 0 and _b <= PROFIT_TARGET_FRACTION * _c:
+                        log("profit target hit on duplicate spread %s/%s: buyback %.2f on credit %.2f"
+                            % (_entry["short_strike"], _entry["long_strike"], _b, _c))
+                        close_position(account, _legs, "50% profit target (duplicate spread)",
+                                       entry=_entry)
+                        orphan_gtcs.pop(_key, None)
+                        continue
+                    if now.time() >= HARD_EXIT:
+                        log("hard exit 12:55 PT: closing duplicate spread %s/%s"
+                            % (_entry["short_strike"], _entry["long_strike"]))
+                        close_position(account, _legs, "hard exit 12:55 PT (duplicate spread)",
+                                       entry=_entry)
+                        orphan_gtcs.pop(_key, None)
                 # HARD EXIT: 12:55 p.m. PT, 5 minutes before the close.
                 # Closes whatever is open, at the mid, whatever its P&L.
                 # The close cancels the working GTC first.
@@ -1096,14 +1217,17 @@ def run_once():
                 # Cancel a working entry when the window ends: no entries
                 # after 12:00 p.m. PT, so a stale order must not fill late.
                 if working_entry is not None and not in_window:
-                    try:
-                        cancel_order(account, working_entry["id"])
+                    if cancel_confirmed(account, working_entry["id"]):
                         log("entry order %s cancelled, window ended"
                             % working_entry["id"])
-                    except Exception as exc:  # noqa: BLE001 - best effort
-                        log("entry order %s cancel failed (%s), ignoring"
-                            % (working_entry["id"], exc))
-                    working_entry = None
+                        working_entry = None
+                    else:
+                        # Still working: keep tracking it and retry the
+                        # cancel next poll; it is a day order and dies
+                        # at the close, but it must not be forgotten
+                        # while it can still fill.
+                        log("entry order %s still working at window end, keeping it tracked"
+                            % working_entry["id"])
                 if not in_window:
                     time.sleep(POLL_SECONDS)
                     continue
@@ -1155,18 +1279,32 @@ def run_once():
                     if (working_entry["direction"] != direction
                             or working_entry["short_strike"] != short_strike
                             or working_entry["long_strike"] != long_strike):
-                        try:
-                            cancel_order(account, working_entry["id"])
+                        if cancel_confirmed(account, working_entry["id"]):
                             log("entry order %s cancelled, trend/strikes moved"
                                 % working_entry["id"])
-                        except Exception as exc:  # noqa: BLE001 - best effort
-                            log("entry order %s cancel failed (%s), ignoring"
-                                % (working_entry["id"], exc))
-                        working_entry = None
+                            working_entry = None
+                        else:
+                            # Still working: do NOT place a replacement
+                            # on top of it. Keep it tracked and retry
+                            # the cancel next poll.
+                            log("entry order %s still working, replacement skipped this poll"
+                                % working_entry["id"])
+                            time.sleep(POLL_SECONDS)
+                            continue
                     else:
                         # Same trend, same strikes: leave it working.
                         time.sleep(POLL_SECONDS)
                         continue
+                # No new entry while any 0DTE credit order is working
+                # (a pre-restart entry the in-memory state lost, or a
+                # manual order): placing on top of it opens a second
+                # position. Skip this poll and retry.
+                _blocked_credit, _blocking_id = has_pending_credit_entry(account)
+                if _blocked_credit:
+                    log("no entry: pending credit order %s still working, skipping this poll"
+                        % _blocking_id)
+                    time.sleep(POLL_SECONDS)
+                    continue
                 log("entry: SPX %.2f %s EMA %d %.2f / EMA %d %.2f, %s %d/%d %s "
                     "limit %.2f x %d"
                     % (spx, direction, EMA_FAST, ema_fast, EMA_SLOW, ema_slow,
@@ -1188,6 +1326,9 @@ def run_once():
                     "long_strike": long_strike,
                     "kind": kind,
                 }
+                # Remember every entry this run placed, so the backstop
+                # can find a duplicate spread if one ever fills.
+                own_entries.append(working_entry)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)
         time.sleep(POLL_SECONDS)

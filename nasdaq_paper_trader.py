@@ -813,9 +813,16 @@ def walk_up_target(bid, debit, offset, step=WALK_STEP):
     to the current bid each cycle, so a market move re-bases the
     walk-up; the cap is applied here, so a widening gap is reached
     immediately and the price pins at the mid once the offset covers
-    the gap."""
-    target = round(min(bid + offset, debit), 2)
-    return target, round(offset + step, 2)
+    the gap. The target is never at or below zero: a negative spread
+    bid (a broken quote, not a bargain — GOOGL, Nov 16) is floored
+    at $0.01, and when even the mid is at or below zero there is
+    nothing to bid, so None is returned and the caller skips the
+    ticker this cycle instead of placing a bid Tradier rejects
+    (HTTP 400)."""
+    if debit <= 0:
+        return None, offset
+    target = round(min(max(bid, 0.01) + offset, debit), 2)
+    return max(target, 0.01), round(offset + step, 2)
 
 
 def place_bid_order(account, ticker, short_exp, long_exp, put, call, price):
@@ -1068,6 +1075,13 @@ def run_once():
                             # it alone, retry next cycle.
                             continue
                         bid_orders.pop(ticker, None)
+                    if target is None:
+                        # No positive price to bid (mid at or below
+                        # zero): skip this ticker this cycle rather
+                        # than placing a bid Tradier rejects (HTTP 400).
+                        # The stale bid above was already cancelled.
+                        skips.append("%s non-positive spread" % ticker)
+                        continue
                     log("entry: %s %.2f short %s / long %s %dP/%dC modeled debit %.2f "
                         "bid %.2f walk-up %.2f x %d"
                         % (ticker, price, short_exp, long_exp, put, call,
