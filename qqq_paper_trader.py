@@ -729,9 +729,19 @@ def run_once():
                 # half the debit (value at or under STOP_LOSS_FRACTION of
                 # basis). Poll-based — the GTC slot is held by the
                 # take-profit — so a gap between polls can overshoot it.
+                # Nov 18, 2026: re-verify on a fresh read before
+                # closing. A one-poll mid spike (a stale/wide leg quote)
+                # can trip the exit on a valuation that does not hold;
+                # skip the close when the fresh read is back above the
+                # stop level and retry next poll.
                 if basis > 0 and value <= STOP_LOSS_FRACTION * basis:
-                    log("stop-loss hit: value %.2f on basis %.2f" % (value, basis))
-                    close_position(account, legs)
+                    _v2, _b2, _l2 = position_value_and_basis(account)
+                    if _l2 and _v2 <= STOP_LOSS_FRACTION * _b2:
+                        log("stop-loss hit: value %.2f on basis %.2f" % (value, basis))
+                        close_position(account, legs)
+                    else:
+                        log("stop-loss: trigger print %.2f did not hold on re-read (value %.2f), skipping close"
+                            % (value, _v2))
                     time.sleep(POLL_SECONDS)
                     continue
                 # Time exit: close when the short leg has 1 day or less
@@ -747,9 +757,27 @@ def run_once():
                 # for when no take-profit order is working: there is no
                 # end-of-day forced close, so a position that never
                 # reaches 10% stays open (and blocks new entries).
+                # Nov 18, 2026: the exit fired on a one-poll mid spike
+                # (unrealized +$20.50 on a $137 basis, gone a second
+                # later) and closed at $1.30 for a $7 loss, cancelling
+                # the working $1.51 GTC to do it. Two guards: (1) when
+                # a take-profit GTC is already working, let it fill —
+                # the fallback is only for when no GTC is working;
+                # (2) re-verify the 110% target on a fresh read and
+                # skip the close when the trigger print did not hold.
                 if basis > 0 and unrealized >= 0.10 * basis:
-                    log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, basis))
-                    close_position(account, legs)
+                    _clegs = close_legs_for(legs)
+                    _gtc_working, _gtc_id = has_blocking_pending_order(account, _clegs)
+                    if _gtc_working:
+                        log("10%% exit: take-profit order %s already working, letting it fill" % _gtc_id)
+                    else:
+                        _v2, _b2, _l2 = position_value_and_basis(account)
+                        if _l2 and _v2 >= 1.10 * _b2:
+                            log("10%% exit hit: unrealized %.2f on basis %.2f" % (unrealized, basis))
+                            close_position(account, legs)
+                        else:
+                            log("10%% exit: trigger print %.2f did not hold on re-read (value %.2f), skipping close"
+                                % (value, _v2))
                     time.sleep(POLL_SECONDS)
                     continue
                 # Keep a standing take-profit in place: a GTC credit order
