@@ -64,7 +64,10 @@ to the paper worker.
 - Exits: a standing GTC take-profit is placed when a position opens
   (buy back at 50% of the credit received), and the poll-based
   take-profit remains as a fallback every 60 seconds: take profit when
-  the buy-back cost falls to 50% of the credit received. There is no
+  the buy-back cost falls to 50% of the credit received. The fallback
+  re-verifies the target on a fresh read and never fires while the
+  take-profit GTC is working (Nov 19, 2026: a one-poll phantom print
+  tripped it and cancelled the good GTC). There is no
   stop-loss: a position that moves against the worker is held until
   the 50% take-profit or the 12:55 p.m. PT hard exit. Any close
   (profit or hard exit) cancels the working GTC first, and a new GTC
@@ -897,6 +900,45 @@ def close_position(account, legs, reason, entry=None):
                        exclude_order_id=blocking_id if blocked else None)
 
 
+def fallback_exit_allowed(account, entry, gtc_working, buyback, credit, fraction, below):
+    """Whether the poll-based fallback may close the spread now.
+
+    Guards against one-poll phantom prints. Nov 19, 2026: a $150
+    buyback print tripped the 50% target on the 7335/7340, cancelling
+    the working $0.80 GTC to place a $1.15 close that then blocked
+    re-placing the GTC — the same pattern as the Nov 18 QQQ exit.
+    Two guards, as in the QQQ workers:
+    (1) profit target only: when the take-profit GTC is working, let
+        it fill — the fallback fires only when no GTC is working. A
+        stop skips this guard: the 50% GTC is far out of the money
+        when the stop triggers, so it cannot protect the position.
+    (2) re-verify the target on a fresh read; skip the close when the
+        trigger print did not hold, or when the re-read legs are not
+        the tracked spread's legs.
+    `below` True: exit triggers when buyback <= fraction * credit
+    (profit target). False: buyback >= fraction * credit (stop).
+    Returns True only when the close may proceed.
+    """
+    if below and gtc_working:
+        log("poll exit: take-profit GTC working, letting it fill")
+        return False
+    _b2, _c2, _l2 = position_value_and_basis(account, entry=entry)
+    if not _l2 or _c2 <= 0:
+        log("poll exit: position gone on re-read, skipping close")
+        return False
+    if entry is not None:
+        _strikes = {_leg_kind_strike(l.get("symbol", ""))[1] for l in _l2}
+        if (float(entry["short_strike"]) not in _strikes
+                or float(entry["long_strike"]) not in _strikes):
+            log("poll exit: re-read legs do not match the tracked spread, skipping close")
+            return False
+    if (_b2 <= fraction * _c2) if below else (_b2 >= fraction * _c2):
+        return True
+    log("poll exit: trigger print %.2f did not hold on re-read (buyback %.2f), skipping close"
+        % (buyback, _b2))
+    return False
+
+
 def pnl_snapshot(account, entry=None):
     bal = get_balances(account)
     buyback, credit, legs = position_value_and_basis(account, entry=entry)
@@ -1152,13 +1194,21 @@ def run_once():
                     if _gtc is None:
                         _gtc = place_gtc_take_profit(account, _legs, _c)
                         orphan_gtcs[_key] = _gtc
+                    # Nov 19, 2026: the poll fallback is guarded —
+                    # it never fires while the orphan GTC is working,
+                    # and it re-verifies the 50% target on a fresh
+                    # read (see fallback_exit_allowed).
                     if _c > 0 and _b <= PROFIT_TARGET_FRACTION * _c:
-                        log("profit target hit on duplicate spread %s/%s: buyback %.2f on credit %.2f"
-                            % (_entry["short_strike"], _entry["long_strike"], _b, _c))
-                        close_position(account, _legs, "50% profit target (duplicate spread)",
-                                       entry=_entry)
-                        orphan_gtcs.pop(_key, None)
-                        continue
+                        if fallback_exit_allowed(
+                                account, _entry,
+                                _gtc is not None and gtc_order_working(account, _gtc),
+                                _b, _c, PROFIT_TARGET_FRACTION, True):
+                            log("profit target hit on duplicate spread %s/%s: buyback %.2f on credit %.2f"
+                                % (_entry["short_strike"], _entry["long_strike"], _b, _c))
+                            close_position(account, _legs, "50% profit target (duplicate spread)",
+                                           entry=_entry)
+                            orphan_gtcs.pop(_key, None)
+                            continue
                     if now.time() >= HARD_EXIT:
                         log("hard exit 12:55 PT: closing duplicate spread %s/%s"
                             % (_entry["short_strike"], _entry["long_strike"]))
@@ -1178,12 +1228,20 @@ def run_once():
                 # Profit target: buy back at 50% of the credit
                 # received. The GTC normally closes this first; the
                 # poll is the fallback if the GTC has not filled.
+                # Nov 19, 2026: the fallback is guarded — it never
+                # fires while the take-profit GTC is working, and it
+                # re-verifies the 50% target on a fresh read
+                # (see fallback_exit_allowed).
                 if credit > 0 and buyback <= PROFIT_TARGET_FRACTION * credit:
-                    log("profit target hit: buyback %.2f on credit %.2f"
-                        % (buyback, credit))
-                    close_position(account, legs, "50% profit target",
-                                   entry=open_spread or working_entry)
-                    working_gtc = None
+                    if fallback_exit_allowed(
+                            account, open_spread or working_entry,
+                            working_gtc is not None and gtc_order_working(account, working_gtc),
+                            buyback, credit, PROFIT_TARGET_FRACTION, True):
+                        log("profit target hit: buyback %.2f on credit %.2f"
+                            % (buyback, credit))
+                        close_position(account, legs, "50% profit target",
+                                       entry=open_spread or working_entry)
+                        working_gtc = None
                     time.sleep(POLL_SECONDS)
                     continue
             else:

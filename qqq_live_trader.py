@@ -14,6 +14,9 @@ Implements one fixed rule set, nothing else. It mirrors the SPX worker
 - Short leg 6 DTE at entry (any expiry 5-7 DTE qualifies), long leg the
   next expiry after the short leg. Any weekday pair qualifies.
 - Entry window 8:00 a.m.-12:30 p.m. America/Los_Angeles, weekdays only.
+- VIX gate: a new calendar is taken only when VIX is under VIX_MAX
+  (default 18). At or above 18, or when the VIX quote is unavailable,
+  the entry is skipped for that poll and retried next poll.
 - Walk-up entry, no day skip: while flat and in the window, the worker
   evaluates every poll (3 minutes). When the cheapest pair previews at
   or under MAX_DEBIT, it bids from max(WALK_START, modeled debit minus
@@ -114,6 +117,7 @@ API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(10, int(os.environ.get("CONTRACTS", "1"))))
 MAX_DEBIT = float(os.environ.get("MAX_DEBIT", "1.70"))
+VIX_MAX = float(os.environ.get("VIX_MAX", "18"))
 WALK_START = float(os.environ.get("WALK_START", "0.60"))
 WALK_STEP = float(os.environ.get("WALK_STEP", "0.05"))
 WALK_START_OFFSET = float(os.environ.get("WALK_START_OFFSET", "0.30"))
@@ -194,6 +198,40 @@ def get_qqq_price():
     if not isinstance(quote, dict) or quote.get("last") is None:
         raise ValueError("QQQ quote unavailable (null quote)")
     return float(quote["last"])
+
+
+def get_vix():
+    data = api_get("/v1/markets/quotes?symbols=VIX&greeks=false")
+    quotes_obj = data.get("quotes")
+    # Same null handling as get_qqq_price: raise a clean error so the
+    # caller can skip the entry for this poll instead of trading blind.
+    if not isinstance(quotes_obj, dict):
+        raise ValueError("VIX quote unavailable (null quotes)")
+    quote = quotes_obj.get("quote")
+    if isinstance(quote, list):
+        quote = quote[0] if quote else None
+    if not isinstance(quote, dict) or quote.get("last") is None:
+        raise ValueError("VIX quote unavailable (null quote)")
+    return float(quote["last"])
+
+
+def vix_gate_ok():
+    """Whether a new calendar may be entered under the VIX gate.
+
+    Returns (True, vix) when VIX is under VIX_MAX (default 18), else
+    (False, vix). A failed VIX read also blocks the entry (returns
+    (False, None)) rather than trading blind.
+    """
+    try:
+        vix = get_vix()
+    except Exception as exc:
+        log("entry: VIX unavailable (%s), skipping entry this poll" % exc)
+        return False, None
+    if vix >= VIX_MAX:
+        log("entry: VIX %.2f at or above %.2f, skipping entry this poll"
+            % (vix, VIX_MAX))
+        return False, vix
+    return True, vix
 
 
 def round_strike(price):
@@ -799,6 +837,13 @@ def run_once():
                 # down for 5 minutes before the next one.
                 if (ENTRY_START <= now.time() < ENTRY_END
                         and (next_cycle_time is None or now >= next_cycle_time)):
+                    # Nov 20, 2026: VIX gate — only take a new calendar
+                    # when VIX is under VIX_MAX (default 18); see
+                    # vix_gate_ok. A failed read blocks the entry.
+                    _vix_ok, _vix = vix_gate_ok()
+                    if not _vix_ok:
+                        time.sleep(HOLD_POLL_SECONDS if holding else POLL_SECONDS)
+                        continue
                     qqq = get_qqq_price()
                     pair, cheapest = find_best_pair(qqq, get_expirations())
                     if pair is None:
