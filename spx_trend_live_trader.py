@@ -299,13 +299,15 @@ def get_bars(interval):
     (09:30-16:00 ET). Fetches the last 4 calendar days so the EMA is
     seeded even on a Monday (prior Friday's bars). Timesales times are
     ET; volume is 0 for the index, so only closes are used. Returns []
-    when the endpoint gives nothing usable."""
+    when the endpoint gives nothing usable. Tradier treats `end` as
+    exclusive, so request one day past today to include today's bars."""
     today = datetime.now(TZ).date()
     start = today - timedelta(days=4)
+    end = today + timedelta(days=1)
     try:
         data = api_get(
             "/v1/markets/timesales?symbol=SPX&interval=%s&start=%s&end=%s&session_filter=all"
-            % (interval, start.isoformat(), today.isoformat())
+            % (interval, start.isoformat(), end.isoformat())
         )
     except Exception as exc:  # noqa: BLE001 - no bars, no trend
         log("timesales failed (%s), no trend this poll" % exc)
