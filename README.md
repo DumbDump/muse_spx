@@ -275,9 +275,12 @@ process type. Paper-only by construction: the host is hardcoded to
 
 ## SPX trend vertical spreads (`spx_trend_paper_trader.py`, service `spx-trend-worker`)
 
-A fourth lane, added Nov 11 at the user's request: SPX 0DTE vertical
-credit spreads whose direction follows the trend, with every position
-closed 5 minutes before the market close.
+**DISABLED Nov 23, 2026** (ENABLE_TRADING=0): replaced by the SPX iron
+condor worker below, at the user's instruction. The code stays in the
+repo so the lane can be restored. A fourth lane, added Nov 11 at the
+user's request: SPX 0DTE vertical credit spreads whose direction
+follows the trend, with every position closed 5 minutes before the
+market close.
 
 - Trend: 9/21 EMA crossover on 15-minute SPX bars, seeded from the prior
   sessions' bars so the read is valid from the open. (VWAP is NOT used:
@@ -305,6 +308,58 @@ closed 5 minutes before the market close.
   170eda59), so a stale working entry cannot block a close.
 - Deploy dry-run first (`ENABLE_TRADING` unset/0); flip to `1` only on
   the user's instruction.
+
+## SPX iron condor (`spx_condor_paper_trader.py`, service `spx-condor-worker`)
+
+Replaces the paper SPX trend worker (disabled Nov 23, 2026, same day).
+Built from the iron condor strategy designed Nov 23: VIX under 20,
+30-45 DTE, 16-delta shorts, $20-wide wings, 50% profit target, 2x
+credit stop, and a roll ladder instead of holding losers to expiry.
+
+- Entry filter: VIX < 20 AND (VIX below its 10-day average of daily
+  closes OR down 3 sessions running) AND no VIX spike over 15% in the
+  last 5 sessions. VIX history comes from Tradier's daily history
+  endpoint; when that read fails the filter falls back to the VIX
+  quote alone and logs the degradation.
+- No entry on a day SPX gapped more than 2% from the prior close, and
+  no entry on the day before or the day of a blocked event date
+  (FOMC decision days and CPI release days, DEFAULT_BLOCKED_DATES in
+  the file, verified Nov 2026; override with BLOCKED_DATES).
+- Structure: 30-45 DTE (prefer closest to 35), short strikes at ~16
+  delta each side (nearest listed strike with |delta| in [0.10,
+  0.20]), long strikes the nearest listed strike at least $20 further
+  out, wing width at most $25 — sparse far-dated chains list $100-wide
+  wings, which are rejected and the next expiry is tried. Total mid
+  credit must be $2.00-$10.00. One condor per expiry date, at most 2
+  open at once, 1 contract each. No volume floor (far-dated SPXW legs
+  are thin on the sandbox); the guards are two-sided quotes and the
+  credit range.
+- Entry window 7:00 a.m.-12:00 p.m. PT, weekdays. One limit credit
+  order at the condor's mid; it stays working while the selection
+  still matches and is cancelled if the selection moves or the window
+  ends. Leg-collision avoidance: if any of the four strikes is already
+  held by another lane, that expiry is skipped.
+- Exits: standing GTC take-profit at 50% of the total credit received
+  (entry plus roll credits), poll fallback every 5 minutes (guarded:
+  never fires while the GTC is working, re-verified on a fresh read),
+  stop when the buy-back cost reaches 3x total credit (a loss of 2x
+  the credit). 21-DTE manage: a condor is closed at the mid when its
+  nearest leg expiry is 21 days or fewer away.
+- Adjustment ladder: a side is tested when SPX comes within 1% of its
+  short strike or that short's delta reaches 0.25. The tested side
+  rolls out to the next expiry 7-14 days later and at least $25
+  further out, FOR A CREDIT — if the roll cannot be done for a credit
+  the whole condor is closed instead. After a tested-side roll, the
+  untested side rolls toward SPX when its delta has fallen below 0.10.
+  At most 2 adjustments per condor.
+- Condors are identified from the filled-orders feed (entries and
+  rolls), so a restart re-adopts them with total credit and adjustment
+  count intact. A grouped 4-leg condor in positions with no matching
+  orders is adopted on its position cost basis as a fallback and logged
+  loudly, so no open condor is ever left unmanaged after a restart.
+- Polls every 300 s. Orders are tagged `muse-spx-condor`. Deploy
+  dry-run first (`ENABLE_TRADING` unset/0); flip to `1` only on the
+  user's instruction.
 
 ## Cross-worker position isolation (Nov 11 fix)
 
