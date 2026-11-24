@@ -23,8 +23,8 @@ Replaces the paper SPX trend worker (spx_trend_paper_trader.py, disabled
   closest to 0.16), long strikes the nearest listed strike at least
   $20 further out of the money, wing width at most $25 (sparse
   far-dated chains list $100-wide wings, which are rejected). Total
-  mid credit must be at least $2.00 and at most $10.00. One condor
-  per expiry date, at most 2 open at once, 1 contract each.
+  mid credit must be at least $2.00 and at most $10.00. At most 1
+  open at once, 1 contract each.
 - Exits: a standing GTC take-profit is placed when a condor opens
   (buy back at 50% of the total credit received, entry plus any roll
   credits), and the poll-based exits remain as a fallback every poll:
@@ -54,10 +54,19 @@ Replaces the paper SPX trend worker (spx_trend_paper_trader.py, disabled
 - Condors are identified from the orders feed, not from memory: the
   worker reconstructs its open condors from filled entry and roll
   orders, so a restart re-adopts them with their total credit and
-  adjustment count intact. A grouped 4-leg condor in positions with
-  no matching orders is adopted on its position cost basis as a
-  fallback and logged loudly, so no open condor is ever left
-  unmanaged after a restart.
+  adjustment count intact. Only orders that match this worker's own
+  shape are adopted: a 4-leg credit entry must be a real iron condor
+  (2 puts + 2 calls, one expiry, $20-25 wings, equal quantities,
+  fill credit $2.00-$10.00/share, and — when the feed carries a tag
+  — this worker's tag); a roll's new legs must form a valid vertical
+  of the same shape. Anything else is left untouched and logged.
+  A grouped 4-leg condor in positions with no matching orders is
+  adopted on its position cost basis as a fallback only when its
+  credit is inside the worker's range (with $2/share of headroom for
+  roll credits), and logged loudly, so no open condor is ever left
+  unmanaged after a restart. Every poll the worker also checks the
+  account's open legs and logs any SPXW leg that is not part of an
+  adopted condor: those legs are never touched or managed.
 
 Safety:
 
@@ -126,7 +135,7 @@ WING_WIDTH = int(os.environ.get("WING_WIDTH", "20"))
 MAX_WING_WIDTH = int(os.environ.get("MAX_WING_WIDTH", "25"))
 MIN_CREDIT = float(os.environ.get("MIN_CREDIT", "2.00"))
 MAX_CREDIT = float(os.environ.get("MAX_CREDIT", "10.00"))
-MAX_OPEN = int(os.environ.get("MAX_OPEN", "2"))
+MAX_OPEN = int(os.environ.get("MAX_OPEN", "1"))
 PROFIT_TARGET_FRACTION = float(os.environ.get("PROFIT_TARGET_FRACTION", "0.50"))
 STOP_MULTIPLE = float(os.environ.get("STOP_MULTIPLE", "2.0"))
 MANAGE_DTE = int(os.environ.get("MANAGE_DTE", "21"))
@@ -672,6 +681,82 @@ def _order_fill_credit(order):
     return round(-px * qty * 100.0, 2)
 
 
+def _signed_qty(side, qty):
+    """Signed quantity: sells are negative, buys positive. Order legs
+    carry an unsigned quantity with the direction in `side`; position
+    legs are already signed."""
+    try:
+        q = abs(int(qty or 0))
+    except (TypeError, ValueError):
+        return 0
+    return -q if str(side or "").startswith("sell") else q
+
+
+def _vertical_structure(pairs):
+    """(True, '') when two (symbol, signed_qty) legs form one valid
+    vertical of this worker's shape: same kind, same expiry, one
+    short and one long in the right order (put long below the short,
+    call short below the long), wing $20-$25, equal |quantity|."""
+    if len(pairs) != 2:
+        return False, "not 2 legs"
+    parsed = []
+    for symbol, qty in pairs:
+        if not str(symbol).startswith("SPXW"):
+            return False, "non-SPXW leg %s" % symbol
+        kind, strike = _leg_kind_strike(symbol)
+        exp = _expiry_from_symbol(symbol)
+        if kind is None or exp is None:
+            return False, "unparsed leg %s" % symbol
+        parsed.append((kind, exp, strike, qty))
+    if parsed[0][0] != parsed[1][0]:
+        return False, "mixed kinds"
+    if parsed[0][1] != parsed[1][1]:
+        return False, "mixed expiries"
+    if abs(parsed[0][3]) != abs(parsed[1][3]) or parsed[0][3] == 0:
+        return False, "unequal quantities"
+    kind = parsed[0][0]
+    lo, hi = sorted(parsed, key=lambda t: t[2])
+    if kind == "put":
+        if not (lo[3] > 0 and hi[3] < 0):
+            return False, "put legs not long-below/short-above"
+    else:
+        if not (lo[3] < 0 and hi[3] > 0):
+            return False, "call legs not short-below/long-above"
+    width = hi[2] - lo[2]
+    if not (WING_WIDTH <= width <= MAX_WING_WIDTH):
+        return False, "wing $%.0f outside $%d-$%d" % (width, WING_WIDTH, MAX_WING_WIDTH)
+    return True, ""
+
+
+def _condor_structure(pairs):
+    """(True, '') when four (symbol, signed_qty) legs form an iron
+    condor by this worker's own entry rules: 2 puts + 2 calls, all
+    one expiry, both sides valid verticals. Anything else is not
+    this worker's condor and must be left untouched."""
+    if len(pairs) != 4:
+        return False, "not 4 legs"
+    exps = set()
+    puts, calls = [], []
+    for symbol, qty in pairs:
+        if not str(symbol).startswith("SPXW"):
+            return False, "non-SPXW leg %s" % symbol
+        kind, _strike = _leg_kind_strike(symbol)
+        exp = _expiry_from_symbol(symbol)
+        if kind is None or exp is None:
+            return False, "unparsed leg %s" % symbol
+        exps.add(exp)
+        (puts if kind == "put" else calls).append((symbol, qty))
+    if len(exps) != 1:
+        return False, "mixed expiries"
+    if len(puts) != 2 or len(calls) != 2:
+        return False, "not 2 puts + 2 calls"
+    for side, legs in (("put", puts), ("call", calls)):
+        ok, why = _vertical_structure(legs)
+        if not ok:
+            return False, "%s side: %s" % (side, why)
+    return True, ""
+
+
 def adopt_condors(account, positions):
     """Reconstruct the worker's open condors from the filled-orders
     feed, validated against current positions. Returns a list of
@@ -712,6 +797,30 @@ def adopt_condors(account, positions):
         opens = [s for s in sides if s.endswith("_to_open")]
         closes = [s for s in sides if s.endswith("_to_close")]
         if order.get("type") == "credit" and len(opens) == 4:
+            # Adopt only this worker's own condors. The orders feed
+            # does not reliably echo tags, so a tag is checked when
+            # present and the structure + credit decide the rest: a
+            # foreign 4-leg credit (another strategy, a manual trade)
+            # is left untouched and logged.
+            tag = order.get("tag")
+            if tag is not None and tag != ORDER_TAG:
+                log("SKIP adopting 4-leg credit order %s: tag %s is not this worker's, leaving untouched"
+                    % (order.get("id"), tag))
+                continue
+            pairs = [(str(l.get("option_symbol", "")),
+                      _signed_qty(l.get("side"), l.get("quantity")))
+                     for l in legs]
+            ok, why = _condor_structure(pairs)
+            if not ok:
+                log("SKIP adopting 4-leg credit order %s: %s, leaving untouched"
+                    % (order.get("id"), why))
+                continue
+            contracts = max(abs(q) for _, q in pairs)
+            per_share = _order_fill_credit(order) / (contracts * 100.0)
+            if not (MIN_CREDIT <= per_share <= MAX_CREDIT):
+                log("SKIP adopting 4-leg credit order %s: fill credit $%.2f/share outside $%.2f-$%.2f, leaving untouched"
+                    % (order.get("id"), per_share, MIN_CREDIT, MAX_CREDIT))
+                continue
             condors.append({
                 "legs": [{"symbol": s} for s in symbols],
                 "credit": _order_fill_credit(order),
@@ -723,6 +832,14 @@ def adopt_condors(account, positions):
             close_syms = {s for s, side in zip(symbols, sides) if side.endswith("_to_close")}
             target = _find_by_legs(close_syms)
             if target is None:
+                continue
+            open_pairs = [(str(l.get("option_symbol", "")),
+                           _signed_qty(l.get("side"), l.get("quantity")))
+                          for l in legs if str(l.get("side", "")).endswith("_to_open")]
+            ok, why = _vertical_structure(open_pairs)
+            if not ok:
+                log("SKIP adopting roll order %s: new legs %s, leaving condor as-is"
+                    % (order.get("id"), why))
                 continue
             open_syms = [s for s, side in zip(symbols, sides) if side.endswith("_to_open")]
             kept = [p for p in target["legs"] if p["symbol"] not in close_syms]
@@ -762,6 +879,16 @@ def adopt_condors(account, positions):
     grouped = _group_condors(leftovers)
     for legs in grouped:
         basis = -sum(float(p.get("cost_basis", 0) or 0) for p in legs)
+        contracts = max(abs(float(p.get("quantity", 0) or 0)) for p in legs)
+        per_share = basis / (contracts * 100.0) if contracts else 0.0
+        # Roll credits can lift a real condor above the entry cap, so
+        # the fallback allows $2/share of headroom. A $0.55/share
+        # manual-style condor is still outside and stays untouched.
+        if not (MIN_CREDIT <= per_share <= MAX_CREDIT + 2.00):
+            log("NOT adopting position-grouped condor %s: cost-basis credit $%.2f/share outside $%.2f-$%.2f, leaving untouched"
+                % (", ".join(str(p.get("symbol", "")) for p in legs),
+                   per_share, MIN_CREDIT, MAX_CREDIT + 2.00))
+            continue
         c = {"legs": legs, "credit": round(basis, 2), "adjustments": 0,
              "gtc_id": None, "entry_order_id": None}
         _enrich_condor(c)
@@ -839,6 +966,20 @@ def _group_condors(legs):
                 used_calls.add(j)
                 break
     return out
+
+
+def _untouched_legs(positions, condors):
+    """(SPXW symbols, non-SPXW count) for open legs that are not part
+    of any adopted condor. Those legs are off-limits: another lane's
+    legs, a manual position, anything else. The worker never touches
+    or manages them."""
+    matched = {p["symbol"] for c in condors for p in c["legs"]}
+    spxw_left = sorted({str(p.get("symbol", "")) for p in positions
+                        if str(p.get("symbol", "")).startswith("SPXW")
+                        and str(p.get("symbol", "")) not in matched})
+    other_left = sum(1 for p in positions
+                     if not str(p.get("symbol", "")).startswith("SPXW"))
+    return spxw_left, other_left
 
 
 def condor_buyback_credit(account, condor):
@@ -1201,6 +1342,7 @@ def run_once():
     working_entry = None
     working_rolls = {}  # order id -> {condor key, roll dict}
     gtc_cleanup_done = False
+    last_untouched = None  # (spxw symbols, non-spxw count) from last poll
     while True:
         try:
             now = datetime.now(TZ)
@@ -1250,6 +1392,25 @@ def run_once():
                         working_rolls.pop(oid)
             positions = get_positions(account)
             condors = adopt_condors(account, positions)
+            # Do-not-touch check: any open leg that is not part of an
+            # adopted condor is off-limits — another worker's legs, a
+            # manual position, anything else. Log the set when it
+            # changes so foreign legs stay visible and are never
+            # silently managed.
+            spxw_left, other_left = _untouched_legs(positions, condors)
+            untouched = (tuple(spxw_left), other_left)
+            if untouched != last_untouched:
+                last_untouched = untouched
+                if spxw_left or other_left:
+                    log("check: %d SPXW leg(s) not part of any adopted condor, leaving untouched: %s%s"
+                        % (len(spxw_left), ", ".join(spxw_left),
+                           ("; plus %d non-SPXW position(s), also untouched" % other_left)
+                           if other_left else ""))
+                else:
+                    if positions:
+                        log("check: every open leg belongs to an adopted condor, nothing left untouched")
+                    else:
+                        log("check: account flat, no legs to leave untouched")
             try:
                 spx_txt = "%.2f" % get_spx_price()
                 spx = float(spx_txt)

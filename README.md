@@ -330,8 +330,7 @@ credit stop, and a roll ladder instead of holding losers to expiry.
   0.20]), long strikes the nearest listed strike at least $20 further
   out, wing width at most $25 — sparse far-dated chains list $100-wide
   wings, which are rejected and the next expiry is tried. Total mid
-  credit must be $2.00-$10.00. One condor per expiry date, at most 2
-  open at once, 1 contract each. No volume floor (far-dated SPXW legs
+  credit must be $2.00-$10.00. At most 1 open at once, 1 contract each. No volume floor (far-dated SPXW legs
   are thin on the sandbox); the guards are two-sided quotes and the
   credit range.
 - Entry window 7:00 a.m.-12:00 p.m. PT, weekdays. One limit credit
@@ -354,9 +353,17 @@ credit stop, and a roll ladder instead of holding losers to expiry.
   At most 2 adjustments per condor.
 - Condors are identified from the filled-orders feed (entries and
   rolls), so a restart re-adopts them with total credit and adjustment
-  count intact. A grouped 4-leg condor in positions with no matching
-  orders is adopted on its position cost basis as a fallback and logged
-  loudly, so no open condor is ever left unmanaged after a restart.
+  count intact. Only orders matching this worker's own shape are
+  adopted: a 4-leg credit entry must be a real iron condor (2 puts +
+  2 calls, one expiry, $20-25 wings, equal quantities, credit
+  $2.00-$10.00/share, and this worker's tag when the feed carries
+  one); a roll's new legs must form a valid vertical. A grouped 4-leg
+  condor in positions with no matching orders is adopted on its
+  position cost basis as a fallback only when its credit is inside
+  the worker's range (with $2/share headroom for roll credits), and
+  logged loudly. Every poll the worker checks the account's open legs
+  and logs any SPXW leg not part of an adopted condor: those legs are
+  never touched or managed. At most 1 condor open at once (Nov 23).
 - Polls every 300 s. Orders are tagged `muse-spx-condor`. Deploy
   dry-run first (`ENABLE_TRADING` unset/0); flip to `1` only on the
   user's instruction.
