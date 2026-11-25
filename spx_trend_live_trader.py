@@ -21,7 +21,9 @@ to the paper worker.
   volume-weighted average cannot be computed from this feed.)
 - Spreads are $5 wide, short leg ~0.5% out of the money
   (snapped to the nearest listed $5 strike), long leg $5 further out.
-  Contracts per trade come from CONTRACTS (default 1).
+  Each entry order is 1 contract (ENTRY_CONTRACTS, Nov 25, 2026:
+  the worker places TWO 1-contract entry orders per trade — see
+  below — so CONTRACTS is no longer the entry size).
 - Leg-collision avoidance: before entering, the worker reads every
   open SPXW position in the live account. If either leg's strike is
   already held by another strategy (e.g. a live iron condor), the
@@ -30,17 +32,32 @@ to the paper worker.
   nearby strike is held, the entry is skipped rather than doubling
   up on a leg.
 - Entry window 7:00 a.m.-12:00 p.m. America/Los_Angeles (10:00 a.m.-
-  3:00 p.m. ET), weekdays only. One position at a time. An entry is one
-  limit credit order at the spread's mid, floored at $1.00 (MIN_CREDIT).
-  The legs are chosen so the spread pays at least $1.00: when the
-  ~0.5% out-of-the-money spread pays less, the strikes move toward
-  the money until the credit reaches $1.00 (up to 4 steps, $20,
-  never letting the short strike go in the money). If no nearby
-  strikes reach $1.00, the limit is placed AT $1.00 and sits working
-  until the spread's value rises to it. It stays working while the
-  trend still matches, and is cancelled if the trend flips or the
-  window ends. A trend flip while holding does NOT close and reverse:
-  the open position is held until an exit fires.
+  3:00 p.m. ET), weekdays only. One position at a time. An entry is
+  TWO 1-contract limit credit orders for the same legs, placed
+  together (Nov 25, 2026): the primary at the spread's mid, floored
+  at $1.00 (MIN_CREDIT), and a stretch order at a fixed $3.50 credit
+  (STRETCH_CREDIT). The legs are chosen so the spread pays at least
+  $1.00: when the ~0.5% out-of-the-money spread pays less, the
+  strikes move toward the money until the credit reaches $1.00 (up
+  to 4 steps, $20, never letting the short strike go in the money).
+  If no nearby strikes reach $1.00, the limit is placed AT $1.00 and
+  sits working until the spread's value rises to it. If the primary
+  fills first, the stretch order STAYS working (Nov 25, 2026: it is
+  NOT cancelled on the primary fill) and the single contract is
+  managed normally (50% GTC). The stretch is cancelled only when
+  the primary position closes — normally when its GTC take-profit
+  fills — or at the 12:00 window end. If the stretch order
+  also fills while the primary is still open — both contracts filled
+  — the worker cancels any take-profit GTC and places ONE GTC close
+  for both contracts together at the average entry credit
+  (breakeven: no profit, no loss). If only the stretch fills, the
+  primary stays working (it normally fills within a poll or two at
+  ~$3.50 by price improvement); no GTC is placed until the primary
+  resolves, and the poll fallback and hard exit still cover the
+  position. Both orders stay working while the trend still matches,
+  and are cancelled if the trend flips or the window ends. A trend
+  flip while holding does NOT close and reverse: the open position
+  is held until an exit fires.
 - NO ADOPTION: the worker tracks and manages ONLY the trades it opened
   itself in the current process run (its in-memory entry). It never
   picks up, manages, places a GTC on, or counts a round-trip for any
@@ -67,7 +84,12 @@ to the paper worker.
   the buy-back cost falls to 50% of the credit received. The fallback
   re-verifies the target on a fresh read and never fires while the
   take-profit GTC is working (Nov 19, 2026: a one-poll phantom print
-  tripped it and cancelled the good GTC). There is no
+  tripped it and cancelled the good GTC). Exception: when BOTH entry
+  orders filled, the take-profit is replaced by ONE GTC close for
+  both contracts at the average entry credit (breakeven) — see the
+  entry rule above. The breakeven GTC fills on a retrace to the
+  average; the poll fallback and the 12:55 p.m. PT hard exit remain
+  as backstops. There is no
   stop-loss: a position that moves against the worker is held until
   the 50% take-profit or the 12:55 p.m. PT hard exit. Any close
   (profit or hard exit) cancels the working GTC first, and a new GTC
@@ -78,11 +100,16 @@ to the paper worker.
   fills. No position is ever carried overnight.
 - Every order carries a tag ("muse-spx-trend-live" by default) so the
   worker's own orders are identifiable.
-- At most one pending order at a time: before placing, the worker checks
-  open orders and skips if a colliding order is already pending. A
-  credit order never blocks a debit placement (a credit order is a
-  take-profit or an entry for a position that may be gone — Tradier may
-  refuse to cancel it, so a debit close must not wait on it); a debit
+- At most one pending order at a time, except the deliberate pair:
+  the worker places TWO entry orders (primary + stretch) for the
+  same legs. The stretch placement explicitly excludes the primary
+  order id from the collision check, so the pair is never blocked
+  by its own sibling; any other colliding order still blocks a
+  placement. Before placing, the worker checks open orders and
+  skips if a colliding order is already pending. A credit order
+  never blocks a debit placement (a credit order is a take-profit
+  or an entry for a position that may be gone — Tradier may refuse
+  to cancel it, so a debit close must not wait on it); a debit
   order never blocks a credit placement (a debit order is the GTC
   take-profit or a close for a position that may be gone, so a new
   entry must not wait on it). Credit placements keep the old rule, so
@@ -106,7 +133,7 @@ Railway setup:
 
 - Push this file plus Procfile to a repo, create a Railway service
   from it, and set TRADIER_API_KEY to a Tradier LIVE key and
-  CONTRACTS=2.
+  CONTRACTS=1 (entries are 1 contract per order since Nov 25, 2026).
 - Procfile runs: spx-trend-live-worker: python spx_trend_live_trader.py
 - The worker loops forever, so Railway keeps it running. Logs are the
   P&L record: the program prints a heartbeat line every poll (so
@@ -146,6 +173,13 @@ BASE = "https://%s" % HOST
 API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 CONTRACTS = max(1, min(5, int(os.environ.get("CONTRACTS", "1"))))
+# Dual-order entry (Nov 25, 2026): each entry order is 1 contract,
+# whatever CONTRACTS says — CONTRACTS is kept only for the startup
+# log line, and Railway should carry CONTRACTS=1 to match.
+ENTRY_CONTRACTS = 1
+# Fixed credit for the second ("stretch") entry order: same legs as
+# the primary, fills only if the spread's value rises to it.
+STRETCH_CREDIT = float(os.environ.get("STRETCH_CREDIT", "3.50"))
 SPREAD_WIDTH = int(os.environ.get("SPREAD_WIDTH", "5"))
 OTM_PCT = float(os.environ.get("OTM_PCT", "0.005"))
 ENTRY_START = dtime(7, 0)
@@ -547,8 +581,8 @@ def select_spread(spx, direction, chain, expiry, held_strikes):
             "limit placed at $%.2f"
             % (credit, MIN_CREDIT, credit_steps, limit))
     legs = [
-        ("sell_to_open", option_symbol(expiry, short_strike, "P" if kind == "put" else "C"), CONTRACTS),
-        ("buy_to_open", option_symbol(expiry, long_strike, "P" if kind == "put" else "C"), CONTRACTS),
+        ("sell_to_open", option_symbol(expiry, short_strike, "P" if kind == "put" else "C"), ENTRY_CONTRACTS),
+        ("buy_to_open", option_symbol(expiry, long_strike, "P" if kind == "put" else "C"), ENTRY_CONTRACTS),
     ]
     return (short_strike, long_strike, kind, limit, legs), None
 
@@ -843,6 +877,35 @@ def gtc_order_working(account, order_id):
     return False
 
 
+def order_still_pending(account, order_id):
+    """True when the given order id is still a working order of any
+    type. Used to tell which of the two entry orders filled: an
+    order the worker did not cancel that is no longer pending has
+    filled."""
+    if order_id is None:
+        return False
+    for order in get_pending_orders(account):
+        if str(order.get("id")) == str(order_id):
+            return True
+    return False
+
+
+def place_gtc_close(account, legs, price, label):
+    """Place a standing GTC debit close for the worker's OWN open
+    spread at an explicit per-share price. Returns the order id, or
+    None when the placement is blocked. No check for a pre-existing
+    GTC is done: the worker tracks its GTC by order id in memory
+    and never picks up an order it did not place."""
+    price = max(price, 0.01)
+    close_legs = close_legs_for(legs)
+    resp = place_order(account, "debit", price, close_legs, duration="gtc")
+    if resp.get("blocked") or resp.get("dry_run"):
+        return None
+    order = resp.get("order", resp)
+    log("GTC %s placed id=%s buyback %.2f" % (label, order.get("id"), price))
+    return order.get("id")
+
+
 def place_gtc_take_profit(account, legs, credit):
     """Place the standing GTC take-profit for the worker's OWN open
     spread: a debit order to buy it back at 50% of the credit
@@ -855,15 +918,51 @@ def place_gtc_take_profit(account, legs, credit):
     if credit <= 0 or contracts <= 0:
         return None
     price = round(PROFIT_TARGET_FRACTION * credit / (contracts * 100.0), 2)
-    price = max(price, 0.01)
-    close_legs = close_legs_for(legs)
-    resp = place_order(account, "debit", price, close_legs, duration="gtc")
-    if resp.get("blocked") or resp.get("dry_run"):
+    return place_gtc_close(account, legs, price, "take-profit")
+
+
+def place_breakeven_gtc(account, legs, credit):
+    """Place the standing GTC breakeven close for a position opened
+    by BOTH entry orders (Nov 25, 2026): one debit order for all
+    contracts together at the average entry credit — buy back at
+    exactly what was received, no profit, no loss. `credit` is the
+    position's TOTAL credit (both contracts), so the per-share price
+    is the average of the two fill credits. Returns the order id,
+    or None when the placement is blocked."""
+    contracts = max(abs(int(leg["quantity"])) for leg in legs)
+    if credit <= 0 or contracts <= 0:
         return None
-    order = resp.get("order", resp)
-    log("GTC take-profit placed id=%s buyback %.2f (50%% of credit %.2f)"
-        % (order.get("id"), price, credit))
-    return order.get("id")
+    price = round(credit / (contracts * 100.0), 2)
+    return place_gtc_close(account, legs, price, "breakeven")
+
+
+def verified_basis(account, entry):
+    """Two consecutive position reads that must agree (same legs and
+    credit within a cent) before the caller trusts the basis. A fill
+    landing between the reads — or a torn snapshot — makes them
+    disagree, and the caller retries next poll. Used for the
+    breakeven close, whose price comes straight from the basis: a
+    stale credit would place the close at the wrong average (a
+    breakeven computed from one contract's credit over two
+    contracts' legs locks in a loss). Same re-verify pattern as
+    the poll-fallback guard (Nov 19, 2026). Returns
+    (buyback, credit, legs), or (None, None, None) when the reads
+    disagree or the spread is gone."""
+    b1, c1, l1 = position_value_and_basis(account, entry=entry)
+    if not l1:
+        return None, None, None
+    b2, c2, l2 = position_value_and_basis(account, entry=entry)
+    if not l2:
+        return None, None, None
+
+    def _sig(legs):
+        return sorted((l.get("symbol"), float(l.get("quantity", 0))) for l in legs)
+
+    if _sig(l1) != _sig(l2) or abs(c1 - c2) > 0.01:
+        log("breakeven basis re-read disagreed (credit %.2f vs %.2f), retrying next poll"
+            % (c1, c2))
+        return None, None, None
+    return b2, c2, l2
 
 
 def close_position(account, legs, reason, entry=None):
@@ -1033,17 +1132,37 @@ def run_once():
         log("TRADIER_API_KEY is not set, exiting")
         return 1
     account = resolve_account()
-    log("account %s connected (LIVE host %s, trading %s, contracts %d, "
+    log("account %s connected (LIVE host %s, trading %s, contracts %d/order, stretch %.2f, "
         "spread $%d, short %.1f%% OTM, EMA %d/%d 15-min, hard exit %s PT, "
         "max %d round-trip(s)/day)"
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run",
-           CONTRACTS, SPREAD_WIDTH, OTM_PCT * 100, EMA_FAST, EMA_SLOW,
+           ENTRY_CONTRACTS, STRETCH_CREDIT, SPREAD_WIDTH, OTM_PCT * 100, EMA_FAST, EMA_SLOW,
            HARD_EXIT.strftime("%H:%M"), MAX_ROUND_TRIPS_PER_DAY))
     last_pnl_day = {}
-    # Working entry order: one limit credit order at a time. It stays
-    # working while the trend still matches; it is cancelled when the
-    # trend flips, the strikes move, or the entry window ends.
+    # Working entry orders: TWO 1-contract limit credit orders for the
+    # same legs (Nov 25, 2026). The primary at the mid, the stretch
+    # at a fixed $3.50 credit. Both stay working while the trend
+    # still matches; both are cancelled when the trend flips, the
+    # strikes move, or the entry window ends.
     working_entry = None
+    stretch_entry = None
+    # Sticky fill flags: set the first poll an entry order is seen
+    # gone from pending without the worker cancelling it. A filled
+    # order's tracker is kept (not cleared) until the pair resolves,
+    # so a cancel confirming an already-filled order gone cannot
+    # erase the both-filled transition.
+    primary_filled = False
+    stretch_filled = False
+    # Breakeven mode: both entry orders filled, so the combined
+    # position closes at the average entry credit (one GTC for both
+    # contracts together) instead of the 50% take-profit.
+    breakeven_active = False
+    # Whether the working GTC is a breakeven close (True) or the
+    # 50% take-profit (False) — decides what a re-place places.
+    gtc_is_breakeven = False
+    # Logged-once flag for the stretch-only wait (primary still
+    # working after the stretch filled).
+    stretch_waiting_logged = False
     # Working GTC take-profit: one debit GTC at 50% of the credit, placed
     # when a position opens. Cancelled on any close; a new one is placed
     # when the next position opens.
@@ -1141,37 +1260,119 @@ def run_once():
             if legs:
                 # The tracked spread is open: reset the flat counter.
                 flat_polls = 0
-                # A position means any earlier entry order has filled;
-                # cancel a leftover working entry so it cannot open a
-                # second position after this one closes. Remember which
-                # spread is ours (the entry that just filled) so later
-                # polls keep managing THIS spread.
-                if working_entry is not None:
-                    if open_spread is None:
-                        open_spread = working_entry
-                    if cancel_confirmed(account, working_entry["id"]):
-                        log("entry order %s cancelled after fill"
-                            % working_entry["id"])
-                        working_entry = None
-                    else:
-                        # Still working: keep tracking it so it is
-                        # cancelled on a later poll. Forgetting it
-                        # here is what let a duplicate entry fill.
-                        log("entry order %s still working after fill, keeping it tracked"
-                            % working_entry["id"])
+                # Which entry orders filled? An order the worker did
+                # not cancel that is no longer pending has filled.
+                # Fill flags are sticky: a tracker is kept after its
+                # order fills (not cleared) until the pair resolves,
+                # so a cancel confirming an already-filled order gone
+                # cannot erase the both-filled transition.
+                if working_entry is not None and not order_still_pending(account, working_entry["id"]):
+                    primary_filled = True
+                if stretch_entry is not None and not order_still_pending(account, stretch_entry["id"]):
+                    stretch_filled = True
+                position_contracts = max(abs(int(leg["quantity"])) for leg in legs)
+                # Remember which spread is ours (the entry that just
+                # filled) so later polls keep managing THIS spread.
+                if open_spread is None:
+                    open_spread = working_entry or stretch_entry
+                # Window end with a position open: a still-working
+                # entry order is a pending new entry, not part of
+                # the open position — cancel it (confirmed). The
+                # open position itself keeps being managed (GTC /
+                # fallback / hard exit). Nov 25, 2026: the stretch
+                # stays working after the primary fills, so it can
+                # still be working at 12:00 — the flat branch's
+                # window-end cancel never runs while a position is
+                # open, so this covers it.
+                if now.time() >= ENTRY_END:
+                    if working_entry is not None and not primary_filled:
+                        if cancel_confirmed(account, working_entry["id"]):
+                            log("entry order %s cancelled, window ended (position open)"
+                                % working_entry["id"])
+                            working_entry = None
+                        else:
+                            log("entry order %s still working at window end (position open), keeping it tracked"
+                                % working_entry["id"])
+                    if stretch_entry is not None and not stretch_filled:
+                        if cancel_confirmed(account, stretch_entry["id"]):
+                            log("stretch entry order %s cancelled, window ended (position open)"
+                                % stretch_entry["id"])
+                            stretch_entry = None
+                        else:
+                            log("stretch entry order %s still working at window end (position open), keeping it tracked"
+                                % stretch_entry["id"])
+                # BOTH entry orders filled: the combined position
+                # closes at breakeven, both contracts together.
+                # Cancel any 50% take-profit GTC and place ONE
+                # breakeven GTC at the average entry credit.
+                if primary_filled and stretch_filled and position_contracts >= 2 and not breakeven_active:
+                    _gtc_clear = True
+                    if working_gtc is not None and not gtc_is_breakeven:
+                        if cancel_confirmed(account, working_gtc):
+                            log("take-profit GTC %s cancelled for breakeven close"
+                                % working_gtc)
+                            working_gtc = None
+                        else:
+                            log("take-profit GTC %s still working, breakeven close will retry next poll"
+                                % working_gtc)
+                            _gtc_clear = False
+                    if _gtc_clear:
+                        # Verify the basis on a fresh read first: the
+                        # breakeven price comes straight from it, so
+                        # a torn snapshot would lock in a loss.
+                        _b, _c, _legs = verified_basis(account, open_spread or working_entry)
+                        if _legs is None:
+                            log("breakeven close skipped this poll (basis not verified)")
+                            breakeven_gtc = None
+                        else:
+                            breakeven_gtc = place_breakeven_gtc(account, _legs, _c)
+                        if breakeven_gtc is not None:
+                            working_gtc = breakeven_gtc
+                            gtc_is_breakeven = True
+                            breakeven_active = True
+                            log("breakeven mode: both entries filled, closing %d contracts at average credit %.2f"
+                                % (position_contracts, _c / (position_contracts * 100.0)))
+                        else:
+                            log("breakeven GTC blocked, will retry next poll")
+                # Only the stretch filled, primary still working:
+                # leave the primary working (it normally fills within
+                # a poll or two by price improvement); place no GTC
+                # until it resolves — the poll fallback and hard exit
+                # still cover the position.
+                elif stretch_filled and not primary_filled:
+                    if not stretch_waiting_logged:
+                        log("only stretch entry filled, primary %s still working, waiting for it to resolve"
+                            % (working_entry["id"] if working_entry is not None else "?"))
+                        stretch_waiting_logged = True
                 # Standing GTC take-profit: place one (buy back at 50%
                 # of the credit) when a position opens. The tracked
                 # GTC is verified by order id each poll: a GTC
                 # canceled or rejected out from under the worker must
                 # be re-placed, not trusted from memory. If the
                 # tracked id is no longer a working order, clear it
-                # so a fresh one is placed.
+                # so a fresh one is placed. In breakeven mode the
+                # re-place is a breakeven close, not a take-profit.
+                # While waiting on the primary after a stretch-only
+                # fill, no GTC is placed at all.
                 if working_gtc is not None and not gtc_order_working(account, working_gtc):
                     log("tracked GTC %s no longer working, will re-place"
                         % working_gtc)
                     working_gtc = None
+                    gtc_is_breakeven = False
                 if working_gtc is None:
-                    working_gtc = place_gtc_take_profit(account, legs, credit)
+                    if breakeven_active:
+                        # Re-place the breakeven GTC from a verified
+                        # basis (same torn-snapshot guard as the
+                        # first placement).
+                        _b, _c, _legs = verified_basis(account, open_spread or working_entry)
+                        if _legs is not None:
+                            working_gtc = place_breakeven_gtc(account, _legs, _c)
+                        gtc_is_breakeven = working_gtc is not None
+                    elif stretch_filled and not primary_filled:
+                        pass
+                    else:
+                        working_gtc = place_gtc_take_profit(account, legs, credit)
+                        gtc_is_breakeven = False
                 # Backstop: any OTHER open own spread (a duplicate entry
                 # filled alongside the tracked one) gets the same
                 # treatment — a standing GTC, the 50% profit target,
@@ -1263,6 +1464,11 @@ def run_once():
                 # and ignored. Nothing else is touched: a GTC placed
                 # before a restart belongs to a spread this process
                 # never tracked, and is left working.
+                # Whether a position just closed (a spread was
+                # tracked, or an entry filled): captured BEFORE the
+                # state below is cleared, because the entry cleanup
+                # must run only in the just-closed case.
+                _just_closed = open_spread is not None or primary_filled or stretch_filled
                 open_spread = None
                 if working_gtc is not None:
                     try:
@@ -1273,8 +1479,40 @@ def run_once():
                         log("tracked GTC %s cancel failed (%s), ignoring"
                             % (working_gtc, exc))
                     working_gtc = None
+                breakeven_active = False
+                gtc_is_breakeven = False
+                primary_filled = False
+                stretch_filled = False
+                stretch_waiting_logged = False
+                # An entry order left working after its position
+                # closed must not fill a new position later: cancel
+                # it now (confirmed). This is what cancels the
+                # stretch when the primary position closes (Nov 25,
+                # 2026: the stretch is NOT cancelled on the primary
+                # fill — it is cancelled here, when the position is
+                # confirmed gone). Guarded to the just-closed case:
+                # this block also runs on every flat poll, and a
+                # worker flat with working entries must NOT have
+                # them cancelled out from under it.
+                if _just_closed:
+                    if working_entry is not None:
+                        if cancel_confirmed(account, working_entry["id"]):
+                            log("entry order %s cancelled (spread gone)"
+                                % working_entry["id"])
+                            working_entry = None
+                        else:
+                            log("entry order %s still working (spread gone), keeping it tracked"
+                                % working_entry["id"])
+                    if stretch_entry is not None:
+                        if cancel_confirmed(account, stretch_entry["id"]):
+                            log("stretch entry order %s cancelled (spread gone)"
+                                % stretch_entry["id"])
+                            stretch_entry = None
+                        else:
+                            log("stretch entry order %s still working (spread gone), keeping it tracked"
+                                % stretch_entry["id"])
                 in_window = ENTRY_START <= now.time() < ENTRY_END
-                # Cancel a working entry when the window ends: no entries
+                # Cancel working entries when the window ends: no entries
                 # after 12:00 p.m. PT, so a stale order must not fill late.
                 if working_entry is not None and not in_window:
                     if cancel_confirmed(account, working_entry["id"]):
@@ -1288,6 +1526,14 @@ def run_once():
                         # while it can still fill.
                         log("entry order %s still working at window end, keeping it tracked"
                             % working_entry["id"])
+                if stretch_entry is not None and not in_window:
+                    if cancel_confirmed(account, stretch_entry["id"]):
+                        log("stretch entry order %s cancelled, window ended"
+                            % stretch_entry["id"])
+                        stretch_entry = None
+                    else:
+                        log("stretch entry order %s still working at window end, keeping it tracked"
+                            % stretch_entry["id"])
                 if not in_window:
                     time.sleep(POLL_SECONDS)
                     continue
@@ -1332,27 +1578,44 @@ def run_once():
                     time.sleep(POLL_SECONDS)
                     continue
                 short_strike, long_strike, kind, spread_credit, spread_legs = selected
-                # A working entry is kept only while it still matches the
-                # trend direction and the strikes. Otherwise cancel it
+                # Working entries are kept only while they still match the
+                # trend direction and the strikes. Otherwise cancel both
                 # and re-place at the new strikes.
-                if working_entry is not None:
-                    if (working_entry["direction"] != direction
-                            or working_entry["short_strike"] != short_strike
-                            or working_entry["long_strike"] != long_strike):
-                        if cancel_confirmed(account, working_entry["id"]):
-                            log("entry order %s cancelled, trend/strikes moved"
-                                % working_entry["id"])
-                            working_entry = None
-                        else:
-                            # Still working: do NOT place a replacement
-                            # on top of it. Keep it tracked and retry
-                            # the cancel next poll.
-                            log("entry order %s still working, replacement skipped this poll"
-                                % working_entry["id"])
+                _ref_entry = working_entry or stretch_entry
+                if _ref_entry is not None:
+                    if (_ref_entry["direction"] != direction
+                            or _ref_entry["short_strike"] != short_strike
+                            or _ref_entry["long_strike"] != long_strike):
+                        _cancel_ok = True
+                        if working_entry is not None:
+                            if cancel_confirmed(account, working_entry["id"]):
+                                log("entry order %s cancelled, trend/strikes moved"
+                                    % working_entry["id"])
+                                working_entry = None
+                            else:
+                                # Still working: do NOT place a
+                                # replacement on top of it. Keep it
+                                # tracked and retry the cancel next
+                                # poll.
+                                log("entry order %s still working, replacement skipped this poll"
+                                    % working_entry["id"])
+                                _cancel_ok = False
+                        if stretch_entry is not None:
+                            if cancel_confirmed(account, stretch_entry["id"]):
+                                log("stretch entry order %s cancelled, trend/strikes moved"
+                                    % stretch_entry["id"])
+                                stretch_entry = None
+                            else:
+                                log("stretch entry order %s still working, replacement skipped this poll"
+                                    % stretch_entry["id"])
+                                _cancel_ok = False
+                        if not _cancel_ok:
                             time.sleep(POLL_SECONDS)
                             continue
+                        primary_filled = False
+                        stretch_filled = False
                     else:
-                        # Same trend, same strikes: leave it working.
+                        # Same trend, same strikes: leave both working.
                         time.sleep(POLL_SECONDS)
                         continue
                 # No new entry while any 0DTE credit order is working
@@ -1366,11 +1629,11 @@ def run_once():
                     time.sleep(POLL_SECONDS)
                     continue
                 log("entry: SPX %.2f %s EMA %d %.2f / EMA %d %.2f, %s %d/%d %s "
-                    "limit %.2f x %d"
+                    "primary limit %.2f x %d + stretch limit %.2f x %d"
                     % (spx, direction, EMA_FAST, ema_fast, EMA_SLOW, ema_slow,
                        kind, short_strike, long_strike,
                        "bull put" if kind == "put" else "bear call",
-                       spread_credit, CONTRACTS))
+                       spread_credit, ENTRY_CONTRACTS, STRETCH_CREDIT, ENTRY_CONTRACTS))
                 resp = place_order(account, "credit", spread_credit, spread_legs)
                 if resp.get("blocked"):
                     time.sleep(POLL_SECONDS)
@@ -1389,6 +1652,29 @@ def run_once():
                 # Remember every entry this run placed, so the backstop
                 # can find a duplicate spread if one ever fills.
                 own_entries.append(working_entry)
+                # Second order: same legs, 1 contract, fixed $3.50
+                # credit. Exclude the primary order id from the
+                # collision check — the pair is deliberate, not a
+                # duplicate.
+                resp2 = place_order(account, "credit", STRETCH_CREDIT, spread_legs,
+                                    exclude_order_id=working_entry["id"])
+                if resp2.get("blocked"):
+                    log("stretch entry blocked, continuing with primary only")
+                    stretch_entry = None
+                elif resp2.get("dry_run"):
+                    stretch_entry = None
+                else:
+                    order2 = resp2.get("order", resp2)
+                    stretch_entry = {
+                        "id": order2.get("id"),
+                        "direction": direction,
+                        "short_strike": short_strike,
+                        "long_strike": long_strike,
+                        "kind": kind,
+                    }
+                    own_entries.append(stretch_entry)
+                    log("stretch entry order %s placed at %.2f"
+                        % (stretch_entry["id"], STRETCH_CREDIT))
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log("error: %s" % exc)
         time.sleep(POLL_SECONDS)
