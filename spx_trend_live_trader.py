@@ -94,6 +94,11 @@ to the paper worker.
   the 50% take-profit or the 12:55 p.m. PT hard exit. Any close
   (profit or hard exit) cancels the working GTC first, and a new GTC
   is placed when the next position opens.
+- NICKEL RULE (Nov 25, 2026): SPX options trade in 5-cent
+  increments, so every order price is rounded to the nearest $0.05
+  (half a nickel rounds up) — entry limits, take-profit and breakeven
+  GTCs, and mid closes — with a backstop in place_order so no path
+  can place a non-nickel price.
 - HARD EXIT: every position is closed at 12:55 p.m. PT (3:55 p.m. ET),
   5 minutes before the 4:00 p.m. ET market close, whatever its P&L.
   The check runs every poll, so a failed close is retried until it
@@ -568,7 +573,9 @@ def select_spread(spx, direction, chain, expiry, held_strikes):
             log("spread moved %d step(s) toward the money to %d/%d "
                 "for $%.2f credit"
                 % (credit_steps, short_strike, long_strike, credit))
-        limit = credit
+        # Nickel rule (Nov 25, 2026): the mid credit can land between
+        # 5-cent ticks (e.g. $1.73); the limit is the nearest nickel.
+        limit = round_nickel(credit)
     else:
         # No nearby strikes reach the floor: fall back to the limit
         # floor on the out-of-the-money base strikes.
@@ -649,7 +656,14 @@ def has_blocking_pending_order(account, legs, exclude_id=None, ignore_credit=Fal
 def place_order(account, order_type, price, legs, duration="day", exclude_order_id=None):
     """legs: list of (side, symbol, qty). Returns the API response dict.
     Never creates a second pending order: if a colliding order is already
-    pending, the placement is skipped and logged."""
+    pending, the placement is skipped and logged. Nickel backstop
+    (Nov 25, 2026): every price is rounded to the nearest $0.05 here,
+    so no path can place a non-nickel SPX order even if a caller
+    forgets to round."""
+    _nickel = round_nickel(price)
+    if abs(_nickel - price) > 0.001:
+        log("price %.2f rounded to nickel %.2f" % (price, _nickel))
+        price = _nickel
     blocked, blocking_id = has_blocking_pending_order(
         account, legs, exclude_id=exclude_order_id,
         ignore_credit=(order_type == "debit"),
@@ -890,13 +904,27 @@ def order_still_pending(account, order_id):
     return False
 
 
+def round_nickel(price):
+    """Round a per-share price to the nearest $0.05 (Nov 25, 2026):
+    SPX options trade in 5-cent increments, so every order price the
+    worker places must be a multiple of $0.05. Half a nickel rounds
+    up (0.875 -> 0.90, 0.88 -> 0.90, 2.625 -> 2.65). Computed in
+    integer cents to dodge float error, and floored at $0.05 — a
+    $0.00 price would be rejected."""
+    price = float(price)
+    sign = -1.0 if price < 0 else 1.0
+    cents = int(abs(price) * 100.0 + 0.5)
+    nickels = (cents + 2) // 5
+    return sign * max(0.05, nickels * 5 / 100.0)
+
+
 def place_gtc_close(account, legs, price, label):
     """Place a standing GTC debit close for the worker's OWN open
     spread at an explicit per-share price. Returns the order id, or
     None when the placement is blocked. No check for a pre-existing
     GTC is done: the worker tracks its GTC by order id in memory
     and never picks up an order it did not place."""
-    price = max(price, 0.01)
+    price = round_nickel(max(price, 0.01))
     close_legs = close_legs_for(legs)
     resp = place_order(account, "debit", price, close_legs, duration="gtc")
     if resp.get("blocked") or resp.get("dry_run"):
@@ -917,7 +945,7 @@ def place_gtc_take_profit(account, legs, credit):
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     if credit <= 0 or contracts <= 0:
         return None
-    price = round(PROFIT_TARGET_FRACTION * credit / (contracts * 100.0), 2)
+    price = round_nickel(PROFIT_TARGET_FRACTION * credit / (contracts * 100.0))
     return place_gtc_close(account, legs, price, "take-profit")
 
 
@@ -932,7 +960,7 @@ def place_breakeven_gtc(account, legs, credit):
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
     if credit <= 0 or contracts <= 0:
         return None
-    price = round(credit / (contracts * 100.0), 2)
+    price = round_nickel(credit / (contracts * 100.0))
     return place_gtc_close(account, legs, price, "breakeven")
 
 
@@ -981,7 +1009,7 @@ def close_position(account, legs, reason, entry=None):
         return {"already_closed": True}
     legs = fresh_legs
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
-    price = round(buyback / (contracts * 100.0), 2)
+    price = round_nickel(buyback / (contracts * 100.0))
     close_legs = close_legs_for(legs)
     blocked, blocking_id = has_blocking_pending_order(account, close_legs)
     if blocked:

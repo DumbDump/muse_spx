@@ -356,7 +356,14 @@ def has_blocking_pending_order(account, legs, exclude_id=None, ignore_credit=Fal
 def place_order(account, order_type, price, legs, duration="day", exclude_order_id=None):
     """legs: list of (side, symbol, qty). Returns the API response dict.
     Never creates a second pending order: if a colliding order is already
-    pending, the placement is skipped and logged."""
+    pending, the placement is skipped and logged. Nickel backstop
+    (Nov 25, 2026): every price is rounded to the nearest $0.05 here,
+    so no path can place a non-nickel SPX order even if a caller
+    forgets to round."""
+    _nickel = round_nickel(price)
+    if abs(_nickel - price) > 0.001:
+        log("price %.2f rounded to nickel %.2f" % (price, _nickel))
+        price = _nickel
     blocked, blocking_id = has_blocking_pending_order(
         account, legs, exclude_id=exclude_order_id,
         ignore_credit=(order_type == "debit"))
@@ -552,6 +559,20 @@ def close_legs_for(legs):
     return out
 
 
+def round_nickel(price):
+    """Round a per-share price to the nearest $0.05 (Nov 25, 2026):
+    SPX options trade in 5-cent increments, so every order price the
+    worker places must be a multiple of $0.05. Half a nickel rounds
+    up (0.875 -> 0.90, 0.88 -> 0.90, 2.625 -> 2.65). Computed in
+    integer cents to dodge float error, and floored at $0.05 — a
+    $0.00 price would be rejected."""
+    price = float(price)
+    sign = -1.0 if price < 0 else 1.0
+    cents = int(abs(price) * 100.0 + 0.5)
+    nickels = (cents + 2) // 5
+    return sign * max(0.05, nickels * 5 / 100.0)
+
+
 def place_take_profit(account, legs, basis):
     """Place a GTC credit order to close the position at a 10% gain.
 
@@ -563,7 +584,7 @@ def place_take_profit(account, legs, basis):
     next poll). Silent when an order is already working, so the
     per-poll check does not spam the log."""
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
-    target = round(basis * 1.10 / (contracts * 100.0), 2)
+    target = round_nickel(basis * 1.10 / (contracts * 100.0))
     close_legs = close_legs_for(legs)
     blocked, _ = has_blocking_pending_order(account, close_legs)
     if blocked:
@@ -616,7 +637,7 @@ def close_position(account, legs):
                 for leg in legs)
     basis = sum(float(leg["cost_basis"]) for leg in legs)
     contracts = max(abs(int(leg["quantity"])) for leg in legs)
-    credit = round(value / (contracts * 100.0), 2)
+    credit = round_nickel(value / (contracts * 100.0))
     close_legs = close_legs_for(legs)
     blocked, blocking_id = has_blocking_pending_order(account, close_legs)
     if blocked:
