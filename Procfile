@@ -5,3 +5,4 @@ spx-trend-worker: python spx_trend_paper_trader.py
 spx-trend-live-worker: python spx_trend_live_trader.py
 qqq-live-worker: python qqq_live_trader.py
 spx-condor-worker: python spx_condor_paper_trader.py
+avgo-ema-worker: python avgo_ema_paper_trader.py
