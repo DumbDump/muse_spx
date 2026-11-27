@@ -20,13 +20,16 @@ Implements one fixed rule set, nothing else:
 - Exits: the OPPOSITE crossover closes the position (and the flip is
   queued: the opposite direction is entered on the next poll, once
   the close has filled and the EMA level still agrees), OR a stop
-  loss of 1.5% from the entry price (env STOP_PCT). After a stop-out
-  the worker stays flat until the next fresh crossover; it never
-  re-enters on the same trend that just stopped it out.
+  loss from the entry price (env STOP_PCT, default 1.5%; STOP_PCT=0
+  disables the stop entirely). After a stop-out the worker stays flat
+  until the next fresh crossover; it never re-enters on the same
+  trend that just stopped it out.
 - Positions are held until an exit fires: there is no end-of-day
-  hard exit, so a position may be carried overnight. The stop is
-  evaluated on every poll during market hours from the latest quote;
-  an overnight gap is caught at the first poll after the open.
+  hard exit, so a position may be carried overnight. When enabled,
+  the stop is evaluated on every poll during market hours from the
+  latest quote; an overnight gap is caught at the first poll after
+  the open. With the stop disabled, the only exit is the opposite
+  crossover, so an overnight gap rides unprotected.
 - Orders are market orders, day duration, tagged "muse-avgo-ema".
   Before placing, the worker skips if a working AVGO equity order
   already exists, so a duplicate entry is never placed.
@@ -450,7 +453,7 @@ def poll(state, account, now):
                 state["stopped_out"] = False
                 state["seen_event_bar"] = bar_key
             return
-        if pos["entry"]:
+        if pos["entry"] and STOP_PCT > 0:
             last = get_quote(SYMBOL)
             if last is not None:
                 if pos["side"] == "long" and last <= pos["entry"] * (1 - STOP_PCT):
@@ -519,10 +522,12 @@ def run_once():
         log("TRADIER_API_KEY is not set, exiting")
         return 1
     account = resolve_account()
+    stop_txt = "stop disabled" if STOP_PCT <= 0 else \
+        "stop %.1f%%" % (STOP_PCT * 100)
     log("account %s connected (PAPER host %s, trading %s, %s %d shares, "
-        "EMA %d/%d on 10min, stop %.1f%%)"
+        "EMA %d/%d on 10min, %s)"
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run",
-           SYMBOL, QUANTITY, EMA_FAST, EMA_SLOW, STOP_PCT * 100))
+           SYMBOL, QUANTITY, EMA_FAST, EMA_SLOW, stop_txt))
     state = {"pos": None, "pending_flip": None, "stopped_out": False,
              "foreign": False, "seen_event_bar": None}
     last_pnl_day = {}
