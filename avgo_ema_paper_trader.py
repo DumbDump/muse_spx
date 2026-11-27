@@ -1,35 +1,53 @@
 #!/usr/bin/env python3
-"""AVGO EMA-crossover stock trader for Railway (paper).
+"""AVGO 2-hour RSI(2) / EMA(100) stock trader for Railway (paper).
 
-Implements one fixed rule set, nothing else:
+Implements one fixed rule set, nothing else (spec Nov 27, 2026;
+replaces the EMA 14/45 10-minute crossover worker):
 
 - Tradier PAPER host only (sandbox.tradier.com). The host is hardcoded
   and the program refuses to run against any other host, so it cannot
   touch a live account.
-- Symbol AVGO (env SYMBOL), 100 shares per trade (env QUANTITY).
-- Signal is the EMA 14 / EMA 45 crossover on 10-minute AVGO bars,
-  evaluated on CLOSED bars only: a bar counts once its 10-minute
-  window has ended, so an in-progress bar can never trigger an entry.
-  EMAs are seeded from the prior sessions' bars (last 4 calendar
-  days fetched) so the read is valid from the open. A crossover only
-  counts as fresh when the crossing bar closed today, so a restart
-  after days offline cannot enter on a stale signal.
-- Long entry: EMA 14 crosses ABOVE EMA 45 -> buy QUANTITY shares.
-  Short entry: EMA 14 crosses BELOW EMA 45 -> sell short QUANTITY
-  shares. One position at a time; entries only while flat.
-- Exits: the OPPOSITE crossover closes the position (and the flip is
-  queued: the opposite direction is entered on the next poll, once
-  the close has filled and the EMA level still agrees), OR a stop
-  loss from the entry price (env STOP_PCT, default 1.5%; STOP_PCT=0
-  disables the stop entirely). After a stop-out the worker stays flat
-  until the next fresh crossover; it never re-enters on the same
-  trend that just stopped it out.
-- Positions are held until an exit fires: there is no end-of-day
-  hard exit, so a position may be carried overnight. When enabled,
-  the stop is evaluated on every poll during market hours from the
-  latest quote; an overnight gap is caught at the first poll after
-  the open. With the stop disabled, the only exit is the opposite
-  crossover, so an overnight gap rides unprotected.
+- Symbol AVGO (env SYMBOL), 100 shares per trade (env QUANTITY),
+  one position at a time. Positions are held overnight.
+- Bars are 2-hour, session-aligned: 09:30, 11:30, 13:30, 15:30 ET.
+  The 15:30 bar is 30 minutes (market closes 16:00 ET). Indicators
+  are calculated on the bar's close.
+- Bar source: Tradier 30-minute bars (last 7 days, session_filter=
+  open) aggregated into 2-hour bars. Tradier's 60-minute bars are
+  clock-hour aligned (09:00, 10:00, ...) and do NOT fit this grid,
+  so they are not used. Tradier intraday history only reaches back
+  ~88 days (~248 2-hour bars), which is short of the 300-bar warm-up,
+  so the history is seeded from Yahoo Finance 1-hour bars (2-year
+  lookback, fetched at startup and refreshed daily) and merged with
+  the Tradier bars; on a timestamp collision the Tradier bar wins.
+  Yahoo and Tradier 2-hour closes agree to ~$0.01 on average (max
+  $0.25) over the 248-bar overlap, so the seam is clean. If the
+  Yahoo seed cannot be fetched, the worker runs Tradier-only and
+  simply does not trade until 300 bars are available.
+- Warm-up: no trading until bar 300 (bar 1 is the first bar in the
+  merged history). Indicators are calculated from the first bar.
+- EMA(100) of close: smoothing factor 2/101, seeded from the first
+  close. RSI(2): change = close - previous close; average gain and
+  average loss each Wilder-smoothed with factor 1/2, seeded from the
+  first change; RSI = 100 - 100 / (1 + avgGain / avgLoss).
+- Entry (decided when a bar closes, filled at the next bar's open,
+  only when flat): long when the close is above EMA(100) and RSI(2)
+  is below 10 (buy 100); short when the close is below EMA(100) and
+  RSI(2) is above 90 (sell short 100). In practice the worker acts
+  on the first poll after the bar closes (polls every 60s), which is
+  within ~a minute of the next bar's open; a signal from the 15:30
+  bar is acted on at the next morning's open. There is no stop loss
+  and no take-profit.
+- Exit (decided at a bar's close, filled at the next bar's open):
+  long exits when RSI(2) is above 70 or the trade has been held 80
+  bars or more; short exits (cover) when RSI(2) is below 30 or the
+  trade has been held 80 bars or more. The entry bar counts as bar 1.
+- Signals are evaluated on CLOSED bars only: a 2-hour bar counts
+  once its window has ended (09:30 bar ends 11:30, 11:30 ends 13:30,
+  13:30 ends 15:30, 15:30 ends 16:00 ET). A bar from a past date is
+  closed by definition, which is what makes the 15:30-bar signal
+  (and early-close days) act on the next morning's open. An acted-on
+  bar is remembered, so the same signal can never place twice.
 - Orders are market orders, day duration, tagged "muse-avgo-ema".
   Before placing, the worker skips if a working AVGO equity order
   already exists, so a duplicate entry is never placed.
@@ -37,7 +55,9 @@ Implements one fixed rule set, nothing else:
   equity position. A position is treated as its own only when its
   quantity is exactly +/-QUANTITY and a filled AVGO equity order with
   this worker's tag exists for it. Any other AVGO position is foreign:
-  it is never closed and no new entry is placed while it exists.
+  it is never closed and no new entry is placed while it exists. An
+  adopted position's entry bar is inferred from its tagged fill's
+  timestamp so the 80-bar hold still works.
 
 Safety:
 
@@ -62,11 +82,19 @@ Railway setup:
 
 Notes:
 
-- Tradier sandbox quotes are delayed about 15 minutes. The stop loss
-  is evaluated against that delayed last price, so a fast intraday
-  move can reach the stop before the feed shows it.
+- Tradier sandbox quotes are delayed about 15 minutes, and a 2-hour
+  bar's last 30-minute component may only appear in the feed after
+  its window ends, so a live fill can land a few minutes into the
+  next bar rather than exactly at its open. The backtest models
+  fills at the next bar's open.
 - Entry orders are day orders: an order left unfilled at the close
   expires with the session.
+
+Backtest (Nov 27, 2026, Yahoo 1h bars Nov 26 2024 - Nov 25 2026,
+1,989 2h bars, trading from bar 300): 62 trades, 66.1% win,
++$15,267 closed P&L, profit factor 2.08, max drawdown -$2,843,
+avg hold 6.8 bars. All 62 exits were RSI exits; the 80-bar cap
+never fired. See ~/workspace/your_files/avgo-2h-rsi-backtest-2026-11-27.md.
 
 Usage:
 
@@ -91,14 +119,23 @@ API_KEY = os.environ.get("TRADIER_API_KEY", "")
 ENABLE_TRADING = os.environ.get("ENABLE_TRADING", "0") == "1"
 SYMBOL = os.environ.get("SYMBOL", "AVGO")
 QUANTITY = max(1, int(os.environ.get("QUANTITY", "100")))
-EMA_FAST = int(os.environ.get("EMA_FAST", "14"))
-EMA_SLOW = int(os.environ.get("EMA_SLOW", "45"))
-STOP_PCT = float(os.environ.get("STOP_PCT", "0.015"))
+WARMUP_BARS = int(os.environ.get("WARMUP_BARS", "300"))
+MAX_HOLD_BARS = 80
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 MARKET_OPEN = dtime(6, 30)   # 9:30 a.m. ET
 MARKET_CLOSE = dtime(13, 0)  # 4:00 p.m. ET
 ORDER_TAG = os.environ.get("ORDER_TAG", "muse-avgo-ema")
-BAR_MINUTES = 10
+
+# RSI(2) / EMA(100) setup (fixed by the spec, not tunable by env).
+EMA_PERIOD = 100
+RSI_PERIOD = 2
+RSI_LONG_ENTRY = 10.0
+RSI_SHORT_ENTRY = 90.0
+RSI_LONG_EXIT = 70.0
+RSI_SHORT_EXIT = 30.0
+
+YAHOO_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+             "%s?interval=1h&range=2y&includePrePost=false")
 
 
 def log(msg):
@@ -180,22 +217,42 @@ def get_quote(symbol):
     return float(quote["last"])
 
 
-def get_bars():
-    """Return [(bar_start_et, close)] for SYMBOL 10-minute bars,
-    chronological, regular session only (09:30-16:00 ET), CLOSED bars
-    only: a bar counts once its 10-minute window has ended, so the
-    in-progress bar can never trigger a signal. Fetches the last 4
-    calendar days so the EMAs are seeded even on a Monday (prior
-    Friday's bars). Tradier treats `end` as exclusive, so request one
-    day past today to include today's bars. Returns [] when the
-    endpoint gives nothing usable."""
-    now_et = datetime.now(ET)
+# ------------------------------------------------------------------ bars
+def fetch_yahoo_1h():
+    """Yahoo Finance 1-hour bars for SYMBOL (2-year lookback).
+    Returns [(bar_start_et, open, high, low, close)] chronological,
+    regular session only. Raises on any failure; the caller decides
+    the fallback."""
+    req = urllib.request.Request(YAHOO_URL % SYMBOL)
+    req.add_header("User-Agent",
+                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    result = data["chart"]["result"][0]
+    quote = result["indicators"]["quote"][0]
+    out = []
+    for t, o, h, l, c in zip(result["timestamp"], quote["open"],
+                            quote["high"], quote["low"], quote["close"]):
+        if c is None:
+            continue
+        bar = datetime.fromtimestamp(t, tz=ET)
+        hhmm = bar.strftime("%H:%M")
+        if not ("09:30" <= hhmm <= "15:30"):
+            continue
+        out.append((bar, float(o), float(h), float(l), float(c)))
+    return out
+
+
+def get_tradier_30min():
+    """Tradier 30-minute bars for SYMBOL, last 7 calendar days,
+    regular session only. Returns [(bar_start_et, o, h, l, c)]."""
     today = datetime.now(TZ).date()
-    start = today - timedelta(days=4)
+    start = today - timedelta(days=7)
     end = today + timedelta(days=1)
     try:
         data = api_get(
-            "/v1/markets/timesales?symbol=%s&interval=10min&start=%s&end=%s&session_filter=all"
+            "/v1/markets/timesales?symbol=%s&interval=30min&start=%s&end=%s&session_filter=open"
             % (SYMBOL, start.isoformat(), end.isoformat())
         )
     except Exception as exc:  # noqa: BLE001 - no bars, no signal
@@ -211,70 +268,107 @@ def get_bars():
     for row in rows:
         try:
             t = row.get("time", "")
-            hhmm = t[11:16]
-            if not ("09:30" <= hhmm <= "16:00"):
-                continue
-            bar_start = datetime.fromisoformat(t).replace(tzinfo=ET)
-            # Closed only: the bar's 10-minute window must have ended.
-            if now_et < bar_start + timedelta(minutes=BAR_MINUTES):
-                continue
-            out.append((bar_start, float(row["close"])))
+            bar = datetime.fromisoformat(t).replace(tzinfo=ET)
+            out.append((bar, float(row["open"]), float(row["high"]),
+                        float(row["low"]), float(row["close"])))
         except (KeyError, TypeError, ValueError):
             continue
     return out
 
 
-def ema(values, period):
-    """EMA series, seeded with the SMA of the first `period` values.
-    Returns [] when there are not enough values."""
-    if len(values) < period:
-        return []
-    k = 2.0 / (period + 1)
-    out = [sum(values[:period]) / period]
-    for v in values[period:]:
-        out.append(v * k + out[-1] * (1 - k))
+def aggregate_2h(bars):
+    """Aggregate 1-hour or 30-minute bars into session-aligned
+    2-hour bars: 09:30 <- 09:30..11:00, 11:30 <- 11:30..13:00,
+    13:30 <- 13:30..15:00, 15:30 <- 15:30 alone. Returns a list of
+    dicts {time, open, high, low, close} sorted by time. A group
+    with a missing component still aggregates from what is there."""
+    groups = {}
+    for bar in bars:
+        t = bar[0]
+        hhmm = t.strftime("%H:%M")
+        if hhmm in ("09:30", "10:00", "10:30", "11:00"):
+            key = t.replace(hour=9, minute=30, second=0, microsecond=0)
+        elif hhmm in ("11:30", "12:00", "12:30", "13:00"):
+            key = t.replace(hour=11, minute=30, second=0, microsecond=0)
+        elif hhmm in ("13:30", "14:00", "14:30", "15:00"):
+            key = t.replace(hour=13, minute=30, second=0, microsecond=0)
+        elif hhmm == "15:30":
+            key = t.replace(hour=15, minute=30, second=0, microsecond=0)
+        else:
+            continue
+        groups.setdefault(key, []).append(bar)
+    out = []
+    for key in sorted(groups):
+        g = sorted(groups[key])
+        out.append({"time": key, "open": g[0][1],
+                    "high": max(b[2] for b in g),
+                    "low": min(b[3] for b in g),
+                    "close": g[-1][4]})
     return out
 
 
-def ema_cross(closes, bar_dates, today_et):
-    """Detect the EMA crossover on the last two closed bars.
+def bar_end(bar_start):
+    """When a 2-hour bar's window ends (ET). The 15:30 bar is 30 min."""
+    if bar_start.hour == 15 and bar_start.minute == 30:
+        return bar_start + timedelta(minutes=30)
+    return bar_start + timedelta(hours=2)
 
-    Returns (event, level, fresh) where event is "up" (fast crossed
-    above slow on the last bar), "down" (fast crossed below slow), or
-    None; level is "bull" when fast > slow on the last bar, "bear"
-    when fast < slow, else None; fresh is True only when the crossing
-    bar closed today (a restart after days offline must not enter on
-    a stale signal). Needs at least EMA_SLOW + 1 closes to compare
-    two EMA points."""
+
+def merge_2h(seed_bars, live_bars):
+    """Merge two 2-hour bar lists by start time; live_bars win on a
+    timestamp collision. Returns a sorted, de-duplicated list."""
+    by_time = {b["time"]: b for b in seed_bars}
+    for b in live_bars:
+        by_time[b["time"]] = b
+    return [by_time[k] for k in sorted(by_time)]
+
+
+def closed_bars(bars, now_et):
+    """Bars whose window has ended, or whose date is before today
+    (covers the 15:30 bar after the close and early-close days)."""
+    today = now_et.date()
+    return [b for b in bars
+            if b["time"].date() < today or bar_end(b["time"]) <= now_et]
+
+
+# ------------------------------------------------------------ indicators
+def ema100(closes):
+    """EMA(100) of close, k = 2/101, seeded from the first close."""
+    if not closes:
+        return []
+    k = 2.0 / (EMA_PERIOD + 1)
+    out = [closes[0]]
+    for c in closes[1:]:
+        out.append(c * k + out[-1] * (1 - k))
+    return out
+
+
+def _rsi_value(avg_gain, avg_loss):
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return 100.0 - 100.0 / (1 + avg_gain / avg_loss)
+
+
+def rsi2(closes):
+    """RSI(2): avg gain / avg loss each Wilder-smoothed with factor
+    1/2, seeded from the first change (bar 2). Index 0 is None (no
+    previous close)."""
     n = len(closes)
-    if n < EMA_SLOW + 1:
-        return None, None, False
-    fast = ema(closes, EMA_FAST)
-    slow = ema(closes, EMA_SLOW)
-    # fast[i] is the EMA at closes[i + EMA_FAST - 1];
-    # slow[j] is the EMA at closes[j + EMA_SLOW - 1].
-    # Compare at the same bar index k: fast[k - EMA_FAST + 1] vs
-    # slow[k - EMA_SLOW + 1].
-    def at(k):
-        return fast[k - EMA_FAST + 1], slow[k - EMA_SLOW + 1]
-
-    f_prev, s_prev = at(n - 2)
-    f_last, s_last = at(n - 1)
-    if f_last > s_last:
-        level = "bull"
-    elif f_last < s_last:
-        level = "bear"
-    else:
-        level = None
-    event = None
-    if f_prev <= s_prev and f_last > s_last:
-        event = "up"
-    elif f_prev >= s_prev and f_last < s_last:
-        event = "down"
-    fresh = bool(bar_dates) and bar_dates[-1].date() == today_et
-    return event, level, fresh
+    out = [None] * n
+    if n < 2:
+        return out
+    avg_gain = max(closes[1] - closes[0], 0.0)
+    avg_loss = max(closes[0] - closes[1], 0.0)
+    out[1] = _rsi_value(avg_gain, avg_loss)
+    for i in range(2, n):
+        change = closes[i] - closes[i - 1]
+        avg_gain = (avg_gain + max(change, 0.0)) / 2
+        avg_loss = (avg_loss + max(-change, 0.0)) / 2
+        out[i] = _rsi_value(avg_gain, avg_loss)
+    return out
 
 
+# ---------------------------------------------------------------- orders
 def get_pending_orders(account):
     """Working AVGO equity orders (any tag) plus any working order
     carrying this worker's tag. Used to block duplicate placements."""
@@ -371,6 +465,46 @@ def has_tagged_avgo_fill(account):
     return False
 
 
+def last_tagged_fill_time(account):
+    """Create time of the most recent filled tagged AVGO equity order,
+    as an aware ET datetime, or None. Used to infer the entry bar of
+    an adopted position."""
+    latest = None
+    for order in get_orders(account):
+        if order.get("status") != "filled":
+            continue
+        if order.get("tag") != ORDER_TAG:
+            continue
+        if order.get("symbol") != SYMBOL or order.get("class") != "equity":
+            continue
+        raw = order.get("create_date") or order.get("transaction_date")
+        if not raw:
+            continue
+        try:
+            t = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=ET)
+        t = t.astimezone(ET)
+        if latest is None or t > latest:
+            latest = t
+    return latest
+
+
+def infer_entry_signal_bar(bars, fill_time):
+    """Index of the entry signal bar for a position filled at
+    fill_time: the fill happens at the open of some bar, and the
+    signal bar is the bar before it. Returns None when it cannot be
+    determined."""
+    if fill_time is None:
+        return None
+    for idx, bar in enumerate(bars):
+        if bar["time"] <= fill_time < bar_end(bar["time"]):
+            return idx - 1 if idx > 0 else 0
+    return None
+
+
 def pnl_snapshot(account):
     try:
         bal = get_balances(account)
@@ -379,6 +513,50 @@ def pnl_snapshot(account):
                bal.get("open_pl")))
     except Exception as exc:  # noqa: BLE001 - snapshot is best-effort
         log("P&L snapshot failed (%s)" % exc)
+
+
+def refresh_yahoo_seed(state, force=False):
+    """(Re)fetch the Yahoo 1h seed and store its 2h bars in state.
+    Best-effort: on failure the previous seed is kept (or an empty
+    seed when there never was one). A failed fetch is retried at most
+    once an hour, so a Yahoo outage never turns into a retry storm.
+    Returns True when a seed is available afterwards."""
+    today = datetime.now(TZ).date()
+    if not force and state.get("yahoo_date") == today \
+            and state.get("yahoo_2h"):
+        return True
+    if not force and state.get("yahoo_next_retry") is not None \
+            and datetime.now(TZ) < state["yahoo_next_retry"]:
+        return bool(state.get("yahoo_2h"))
+    try:
+        bars_1h = fetch_yahoo_1h()
+    except Exception as exc:  # noqa: BLE001 - seed is best-effort
+        state["yahoo_next_retry"] = datetime.now(TZ) + timedelta(hours=1)
+        log("Yahoo seed fetch failed (%s); %s"
+            % (exc, "keeping previous seed"
+               if state.get("yahoo_2h") else "running Tradier-only"))
+        return bool(state.get("yahoo_2h"))
+    seed_2h = aggregate_2h(bars_1h)
+    state["yahoo_2h"] = seed_2h
+    state["yahoo_date"] = today
+    state["yahoo_next_retry"] = None
+    log("Yahoo seed refreshed: %d 2h bars, %s..%s"
+        % (len(seed_2h), seed_2h[0]["time"].date() if seed_2h else "-",
+           seed_2h[-1]["time"].date() if seed_2h else "-"))
+    return True
+
+
+def get_signal_bars(state):
+    """Merged, closed 2-hour bars: Yahoo seed + Tradier 30-min bars
+    (Tradier wins on collision). Returns [] when the Tradier read
+    fails."""
+    live_30 = get_tradier_30min()
+    if not live_30 and not state.get("yahoo_2h"):
+        return []
+    live_2h = aggregate_2h(live_30)
+    merged = merge_2h(state.get("yahoo_2h") or [], live_2h)
+    now_et = datetime.now(ET)
+    return closed_bars(merged, now_et)
 
 
 def poll(state, account, now):
@@ -395,12 +573,13 @@ def poll(state, account, now):
         state["foreign"] = False
     elif tracked is not None and abs(raw["qty"]) == tracked["qty"] \
             and (raw["qty"] > 0) == (tracked["side"] == "long"):
-        # Same position we are already tracking; keep the entry price.
+        # Same position we are already tracking; keep the entry price
+        # and the entry signal bar.
         pass
     elif abs(raw["qty"]) == QUANTITY and has_tagged_avgo_fill(account):
         side = "long" if raw["qty"] > 0 else "short"
         state["pos"] = {"side": side, "qty": abs(raw["qty"]),
-                        "entry": raw["entry"]}
+                        "entry": raw["entry"], "signal_bar": None}
         state["foreign"] = False
         log("adopted own %s position %d @ %.2f"
             % (side, abs(raw["qty"]), raw["entry"] or 0))
@@ -415,106 +594,88 @@ def poll(state, account, now):
     if state["foreign"]:
         return
 
-    # -- signal from closed 10-minute bars --------------------------
-    bars = get_bars()
-    today_et = datetime.now(ET).date()
-    if len(bars) < EMA_SLOW + 1:
-        log("only %d closed bars, need %d — no signal"
-            % (len(bars), EMA_SLOW + 1))
+    # -- signal from closed 2-hour bars ------------------------------
+    bars = get_signal_bars(state)
+    if len(bars) < WARMUP_BARS:
+        log("only %d closed 2h bars, need %d (warm-up) — no signal"
+            % (len(bars), WARMUP_BARS))
         return
-    closes = [c for _, c in bars]
-    bar_dates = [t for t, _ in bars]
-    event, level, fresh = ema_cross(closes, bar_dates, today_et)
-    # An event lives on one bar until the next bar closes; remember
-    # which bar's event this worker already acted on, so the same
-    # crossover cannot re-trigger an entry after a stop-out.
-    bar_key = bars[-1][0]
-    if event is not None and state.get("seen_event_bar") == bar_key:
-        event = None
+    closes = [b["close"] for b in bars]
+    ema = ema100(closes)
+    rsi = rsi2(closes)
+    i = len(bars) - 1  # last closed bar
+    bar_key = bars[i]["time"]
+    # Staleness guard: the last closed bar should be today or, on a
+    # Monday / after a holiday, Friday's. Anything older means both
+    # the Tradier read and the Yahoo seed are stale — do not trade
+    # on it.
+    if (datetime.now(ET).date() - bar_key.date()).days > 4:
+        log("last closed 2h bar %s is stale, no signal"
+            % bar_key.strftime("%Y-%m-%d %H:%M"))
+        return
+    if state.get("seen_bar") == bar_key:
+        return  # already acted on this bar's signal
     pos = state["pos"]
 
     # -- manage an open position ------------------------------------
     if pos is not None:
-        # Opposite crossover closes first (it also queues the flip);
-        # the stop is only checked when no crossover fired.
-        if (pos["side"] == "long" and event == "down") or \
-                (pos["side"] == "short" and event == "up"):
-            new_side = "short" if pos["side"] == "long" else "long"
+        if pos.get("signal_bar") is None:
+            # Adopted position: infer the entry signal bar from the
+            # tagged fill's timestamp; fall back to "entered at the
+            # last bar's open" (held = 1) so the 80-bar exit fires
+            # late rather than early. Clamp to the bar before the
+            # last closed bar so a bad fill timestamp can never make
+            # the hold negative.
+            fill_time = last_tagged_fill_time(account)
+            sig = infer_entry_signal_bar(bars, fill_time)
+            pos["signal_bar"] = sig if sig is not None else i - 1
+            if pos["signal_bar"] >= i:
+                pos["signal_bar"] = i - 1
+            log("adopted position entry signal bar %d (fill %s)"
+                % (pos["signal_bar"], fill_time))
+        held = i - pos["signal_bar"]
+        rsi_now = rsi[i]
+        exit_now = False
+        reason = ""
+        if pos["side"] == "long":
+            if rsi_now is not None and rsi_now > RSI_LONG_EXIT:
+                exit_now, reason = True, "RSI(2) %.1f > %.0f" % (
+                    rsi_now, RSI_LONG_EXIT)
+            elif held >= MAX_HOLD_BARS:
+                exit_now, reason = True, "held %d bars" % held
+        else:
+            if rsi_now is not None and rsi_now < RSI_SHORT_EXIT:
+                exit_now, reason = True, "RSI(2) %.1f < %.0f" % (
+                    rsi_now, RSI_SHORT_EXIT)
+            elif held >= MAX_HOLD_BARS:
+                exit_now, reason = True, "held %d bars" % held
+        if exit_now:
             side = "sell" if pos["side"] == "long" else "buy_to_cover"
             resp = place_equity_order(account, side, pos["qty"])
-            if not resp.get("blocked") and not resp.get("dry_run"):
-                state["pending_flip"] = new_side
-                state["stopped_out"] = False
-                state["seen_event_bar"] = bar_key
-                log("opposite crossover: closing %s, flip to %s queued"
-                    % (pos["side"], new_side))
-            elif resp.get("dry_run"):
-                state["pending_flip"] = new_side
-                state["stopped_out"] = False
-                state["seen_event_bar"] = bar_key
-            return
-        if pos["entry"] and STOP_PCT > 0:
-            last = get_quote(SYMBOL)
-            if last is not None:
-                if pos["side"] == "long" and last <= pos["entry"] * (1 - STOP_PCT):
-                    side = "sell"
-                    resp = place_equity_order(account, side, pos["qty"])
-                    if not resp.get("blocked"):
-                        state["stopped_out"] = True
-                        state["pending_flip"] = None
-                        state["seen_event_bar"] = bar_key
-                        log("STOP %.2f <= entry %.2f * %.3f: closing long"
-                            % (last, pos["entry"], 1 - STOP_PCT))
-                    return
-                if pos["side"] == "short" and last >= pos["entry"] * (1 + STOP_PCT):
-                    side = "buy_to_cover"
-                    resp = place_equity_order(account, side, pos["qty"])
-                    if not resp.get("blocked"):
-                        state["stopped_out"] = True
-                        state["pending_flip"] = None
-                        state["seen_event_bar"] = bar_key
-                        log("STOP %.2f >= entry %.2f * %.3f: closing short"
-                            % (last, pos["entry"], 1 + STOP_PCT))
-                    return
+            if not resp.get("blocked"):
+                state["seen_bar"] = bar_key
+                log("exit %s: %s (close %.2f, EMA100 %.2f, RSI(2) %s)"
+                    % (pos["side"], reason, closes[i], ema[i],
+                       "%.1f" % rsi_now if rsi_now is not None else "-"))
         return
 
     # -- flat: entries ----------------------------------------------
-    # A queued flip fires once the close has filled and the EMA level
-    # still agrees with the flip direction.
-    if state["pending_flip"] is not None:
-        want = state["pending_flip"]
-        level_ok = (want == "long" and level == "bull") or \
-            (want == "short" and level == "bear")
-        if level_ok:
-            side = "buy" if want == "long" else "sell_short"
-            resp = place_equity_order(account, side, QUANTITY)
-            if not resp.get("blocked"):
-                state["pending_flip"] = None
-                state["stopped_out"] = False
-                log("flip entry: %s %d %s" % (side, QUANTITY, SYMBOL))
-            return
-        if level is not None:
-            log("flip to %s stale (level now %s), dropping it"
-                % (want, level))
-            state["pending_flip"] = None
+    side = None
+    reason = ""
+    if closes[i] > ema[i] and rsi[i] is not None \
+            and rsi[i] < RSI_LONG_ENTRY:
+        side, reason = "buy", "close %.2f > EMA100 %.2f, RSI(2) %.1f < %.0f" % (
+            closes[i], ema[i], rsi[i], RSI_LONG_ENTRY)
+    elif closes[i] < ema[i] and rsi[i] is not None \
+            and rsi[i] > RSI_SHORT_ENTRY:
+        side, reason = "sell_short", "close %.2f < EMA100 %.2f, RSI(2) %.1f > %.0f" % (
+            closes[i], ema[i], rsi[i], RSI_SHORT_ENTRY)
+    if side is None:
         return
-
-    # A stop-out blocks re-entry until the next fresh crossover.
-    if state["stopped_out"]:
-        if event is not None and fresh:
-            state["stopped_out"] = False
-            log("fresh crossover %s after stop-out, entries resume" % event)
-        else:
-            return
-
-    if event is None or not fresh:
-        return
-    side = "buy" if event == "up" else "sell_short"
     resp = place_equity_order(account, side, QUANTITY)
     if not resp.get("blocked"):
-        state["seen_event_bar"] = bar_key
-        log("crossover %s: entering %s %d %s"
-            % (event, side, QUANTITY, SYMBOL))
+        state["seen_bar"] = bar_key
+        log("entry %s: %s" % (side, reason))
 
 
 def run_once():
@@ -522,14 +683,13 @@ def run_once():
         log("TRADIER_API_KEY is not set, exiting")
         return 1
     account = resolve_account()
-    stop_txt = "stop disabled" if STOP_PCT <= 0 else \
-        "stop %.1f%%" % (STOP_PCT * 100)
     log("account %s connected (PAPER host %s, trading %s, %s %d shares, "
-        "EMA %d/%d on 10min, %s)"
+        "2h RSI(2)/EMA(100), warm-up %d bars)"
         % (account, HOST, "ENABLED" if ENABLE_TRADING else "dry-run",
-           SYMBOL, QUANTITY, EMA_FAST, EMA_SLOW, stop_txt))
-    state = {"pos": None, "pending_flip": None, "stopped_out": False,
-             "foreign": False, "seen_event_bar": None}
+           SYMBOL, QUANTITY, WARMUP_BARS))
+    state = {"pos": None, "foreign": False, "seen_bar": None,
+             "yahoo_2h": [], "yahoo_date": None}
+    refresh_yahoo_seed(state, force=True)
     last_pnl_day = {}
     while True:
         try:
@@ -548,6 +708,9 @@ def run_once():
                 log("outside market window, waiting")
                 time.sleep(POLL_SECONDS)
                 continue
+            # Refresh the Yahoo seed once a day so the merged history
+            # never develops a gap behind Tradier's rolling window.
+            refresh_yahoo_seed(state)
             pos_txt = "flat"
             if state["pos"] is not None:
                 pos_txt = "%s %d @ %.2f" % (
@@ -555,10 +718,6 @@ def run_once():
                     state["pos"]["entry"] or 0)
             elif state["foreign"]:
                 pos_txt = "foreign AVGO held, no entries"
-            elif state["pending_flip"]:
-                pos_txt = "flat, flip to %s queued" % state["pending_flip"]
-            elif state["stopped_out"]:
-                pos_txt = "flat, stopped out, waiting for next cross"
             try:
                 last_txt = "%.2f" % get_quote(SYMBOL)
             except Exception:
